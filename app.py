@@ -27,10 +27,10 @@ ui.apply()
 def get_market(ticker, years, horizon):
     close = md.load_history(ticker, years)
     spot = float(close.iloc[-1])
-    r = md.risk_free_rate()
+    r, r_src = md.risk_free_rate(ticker)     # 한국 종목은 원화 금리(CD 91일)
     q = md.dividend_yield(ticker, spot)
     opt = md.atm_implied_vol(ticker, spot, round(horizon * 365 / 252), r, q)
-    return close, spot, r, q, opt
+    return close, spot, r, q, opt, r_src
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -38,13 +38,13 @@ def get_direction(ticker, h, cost_bps):
     """방향 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
     close = md.load_history(ticker, 10)
     macro = md.load_macro(ticker)
-    lag = not md.is_us_ticker(ticker)          # 한국 장은 미국보다 먼저 끝나므로 미국 지표를 하루 늦춤
     alt, alt_status = ad.build_alt_features(ticker, close.index)
-    wf, _ = dr.walk_forward(close, h, macro, lag, alt)
+    # 거시 지표 시차는 티커로 자동 결정 (한국 종목이면 미국 지표를 하루 늦춤)
+    wf, _ = dr.walk_forward(close, h, macro, alt=alt, ticker=ticker)
     if wf.empty:
         raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 3년 필요)")
     ev = dr.evaluate(wf, h, np.log(close).diff(), cost_bps)
-    p_up, pick, now_all, contrib, asof = dr.predict_now(close, h, wf, macro, lag, alt)
+    p_up, pick, now_all, contrib, asof = dr.predict_now(close, h, wf, macro, alt=alt, ticker=ticker)
     alt_status["시장 옵션 심리(SKEW·VVIX)"] = "사용" if macro is not None and "skew" in macro else "데이터 없음"
     alt_status["거시(VIX·금리·신용)"] = "사용" if macro is not None else "데이터 없음"
     if not md.is_us_ticker(ticker):
@@ -117,7 +117,7 @@ hero_slot = st.empty()
 
 try:
     with st.spinner(f"{ticker} 데이터 불러오는 중…"):
-        close, spot, r, q, opt = get_market(ticker, years, horizon)
+        close, spot, r, q, opt, r_src = get_market(ticker, years, horizon)
 except Exception as e:
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
@@ -535,7 +535,7 @@ with tab3:
 | GARCH 예측 RV (옵션 만기 {opt_days}거래일 평균) | {rv_opt:.2%} |
 | + VRP | {vrp:.2%} |
 | **edge = IV − (RV + VRP)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
-| 무위험이자율 / 배당수익률 | {r:.2%} / {q:.2%} |
+| 무위험이자율 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
 """)
         st.subheader(f"신호: {VolatilityTradingLogic.LABELS[signal]}")
         position = signal if signal != 0 else st.radio(

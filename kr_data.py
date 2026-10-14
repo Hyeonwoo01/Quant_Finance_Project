@@ -51,6 +51,25 @@ def ecos_series(stat, item, start, end, cycle="D", key=None):
                      index=pd.to_datetime([r["TIME"] for r in rows], format="%Y%m%d"), name=item)
 
 
+def kr_short_rate():
+    """한국 단기 무위험이자율 = 최근 CD(91일) 금리(소수). 미국 13주 국채(^IRX)에 대응한다.
+
+    ECOS 키가 없거나 무효(재발급 등)이면 공개 샘플 키로 받는다 (샘플은 한 번에 10행까지라 최근 3주만 요청).
+    둘 다 실패하면 None."""
+    end = pd.Timestamp.today()
+    for key in dict.fromkeys([get_key("ECOS_API_KEY"), "sample"]):
+        if not key:
+            continue
+        url = (f"https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/1/10/"
+               f"817Y002/D/{end - pd.Timedelta(days=21):%Y%m%d}/{end:%Y%m%d}/010502000")
+        try:
+            rows = requests.get(url, timeout=15).json()["StatisticSearch"]["row"]
+            return float(rows[-1]["DATA_VALUE"]) / 100.0
+        except Exception:
+            continue
+    return None
+
+
 def ecos_rates(start, end=None):
     """국고채 3년·10년, 회사채 AA- 3년 일별 금리(%). 키가 없으면 None."""
     if not get_key("ECOS_API_KEY"):

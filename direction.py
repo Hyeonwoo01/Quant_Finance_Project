@@ -17,6 +17,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 
 import alt_data
+import market_data
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
@@ -45,13 +46,25 @@ MODEL_LABELS = {"base": "기본 확률 (항상 과거 상승비율)", "logit_pri
 
 
 # ---------------- 특징 ----------------
-def build_features(close, macro=None, lag_macro=False, alt=None):
+def resolve_lag(lag_macro, ticker):
+    """거시 지표를 하루 늦출지. 명시하지 않으면 티커로 판단하고, 티커도 모르면 안전하게 늦춘다.
+
+    한국 장(15:30 마감)은 같은 날짜 미국 장보다 먼저 끝나므로, 같은 날짜의 미국·글로벌 값은 아직 모르는 정보."""
+    if lag_macro is not None:
+        return bool(lag_macro)
+    if ticker:
+        return not market_data.is_us_ticker(ticker)
+    return True
+
+
+def build_features(close, macro=None, lag_macro=None, alt=None, ticker=None):
     """t일 종가까지의 정보만 쓰는 특징들 (미래 정보 없음).
 
-    macro: market_data.load_macro()의 DataFrame. lag_macro=True면 하루 늦춰 붙인다
-    (한국 종목처럼 미국 지표보다 먼저 장이 끝나는 경우, 같은 날짜 미국 값은 아직 모르는 정보).
+    macro: market_data.load_macro()의 DataFrame. 거시 지표를 하루 늦출지는 resolve_lag()가 정한다
+    (lag_macro를 주면 그대로, 아니면 ticker로 판단, 둘 다 없으면 늦춤).
     alt: alt_data.build_alt_features()의 DataFrame (이미 공개 시점에 맞춰져 있음).
     """
+    lag_macro = resolve_lag(lag_macro, ticker)
     lc = np.log(close)
     r = lc.diff()
     f = pd.DataFrame(index=close.index)
@@ -214,14 +227,14 @@ def _logloss(p, y):
 
 
 # ---------------- 워크포워드 ----------------
-def walk_forward(close, h, macro=None, lag_macro=False, alt=None, min_train=500, refit_every=21,
-                 select_window=756, min_scored=252):
+def walk_forward(close, h, macro=None, lag_macro=None, alt=None, min_train=500, refit_every=21,
+                 select_window=756, min_scored=252, ticker=None):
     """각 시점 t에서 't까지 알 수 있던 데이터'로만 모든 후보를 학습하고 예측한다.
 
     'auto' 열: 블록 시작 t에서, 결과가 이미 확정된(행 ≤ t−h) 과거 예측들 중 최근 select_window개의
     로그손실이 가장 낮은 후보를 고른다. 채점된 예측이 min_scored개 미만이면 기본 확률을 쓴다.
     """
-    feat = build_features(close, macro, lag_macro, alt)
+    feat = build_features(close, macro, lag_macro, alt, ticker)
     fwd = forward_log_return(close, h).reindex(feat.index)
     X, y = feat.values, (fwd.values > 0).astype(float)
     n = len(feat)
@@ -283,12 +296,12 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0):
             "chosen_share": wf["chosen"].value_counts(normalize=True)}
 
 
-def predict_now(close, h, wf, macro=None, lag_macro=False, alt=None, select_window=756):
+def predict_now(close, h, wf, macro=None, lag_macro=None, alt=None, select_window=756, ticker=None):
     """결과가 확정된 모든 과거로 학습 → 오늘의 P(상승).
 
     고르는 모델은 워크포워드에서 최근 select_window개 채점 성적이 가장 좋은 후보.
     """
-    feat = build_features(close, macro, lag_macro, alt)
+    feat = build_features(close, macro, lag_macro, alt, ticker)
     fwd = forward_log_return(close, h).reindex(feat.index)
     known = fwd.notna().values
     X, y = feat.values, (fwd.values > 0).astype(float)

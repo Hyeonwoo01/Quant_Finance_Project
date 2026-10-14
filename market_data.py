@@ -51,13 +51,22 @@ def load_macro(ticker, years=10):
     return d if len(d) > 500 else None
 
 
-def risk_free_rate(default=0.04):
-    """13주 미국 국채 금리(^IRX). 실패하면 기본값."""
+def risk_free_rate(ticker="", default=0.04):
+    """종목 통화에 맞는 단기 무위험이자율과 출처. 반환: (금리(소수), 출처 이름).
+
+    한국 종목(원화) → 한국은행 ECOS CD(91일), 그 외 → 미국 13주 국채(^IRX). 실패하면 기본값."""
+    if ticker and not is_us_ticker(ticker):
+        kr = kr_data.kr_short_rate()
+        if kr is not None and np.isfinite(kr):
+            return kr, "CD 91일 (ECOS)"
+        return default, "기본값 (ECOS 조회 실패)"
     try:
         v = yf.Ticker("^IRX").history(period="10d")["Close"].dropna()
-        return float(v.iloc[-1]) / 100.0 if len(v) else default
+        if len(v):
+            return float(v.iloc[-1]) / 100.0, "미국 13주 국채 (^IRX)"
     except Exception:
-        return default
+        pass
+    return default, "기본값 (^IRX 조회 실패)"
 
 
 def dividend_yield(ticker, spot):

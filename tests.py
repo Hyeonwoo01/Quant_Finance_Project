@@ -164,6 +164,22 @@ for m in ("ridge", "composite", "auto"):
     rows = sa.index[sa.index <= cut]
     assert len(rows) > 5 and np.allclose(sa.loc[rows].values, sb.loc[rows].values, equal_nan=True), m
 
+# 거시 지표 시차: 명시 > 티커로 자동 판단 > 모르면 안전하게 하루 늦춤
+assert dr.resolve_lag(None, "005930.KS") and dr.resolve_lag(None, "247540.KQ")
+assert not dr.resolve_lag(None, "AAPL") and not dr.resolve_lag(None, "SPY")
+assert dr.resolve_lag(None, None) and not dr.resolve_lag(False, "005930.KS")
+mi = pd.bdate_range("2019-01-01", periods=700)
+g2 = np.random.default_rng(11)
+macro_t = pd.DataFrame({k: 50 + np.cumsum(g2.normal(0, 1, len(mi))) for k in
+                        ("vix", "vix3m", "tnx", "irx", "hyg", "ief", "market")}, index=mi).abs() + 10
+px_t = pd.Series(100 * np.exp(np.cumsum(g2.normal(0, 0.01, len(mi)))), index=mi)
+f_kr = dr.build_features(px_t, macro_t, ticker="005930.KS")
+f_us = dr.build_features(px_t, macro_t, ticker="AAPL")
+d0 = f_kr.index[-1]
+assert f_kr.loc[d0, "vix"] == np.log(macro_t["vix"]).loc[:d0].iloc[-2]      # 한국: 전날 미국 값
+assert f_us.loc[d0, "vix"] == np.log(macro_t["vix"]).loc[d0]                # 미국: 같은 날 값
+assert f_kr.equals(dr.build_features(px_t, macro_t, lag_macro=True))
+
 # 가치 지표: 4분기 = 연간 − (1~3분기), 최근 4분기 합(TTM), 공시 다음 거래일부터 반영
 fin = pd.DataFrame([
     {"code": "000010", "year": 2023, "q": 1, "rcept_dt": pd.Timestamp("2023-05-15"), "equity": 100.0, "ni": 10.0},
