@@ -1,0 +1,17 @@
+[theme]
+base = "light"
+primaryColor = "#0a0a0a"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f7f7f7"
+textColor = "#1c1c1e"
+linkColor = "#3772cf"
+borderColor = "#e5e5e5"
+showWidgetBorder = true
+baseRadius = "8px"
+buttonRadius = "full"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+codeFont = "'Geist Mono':https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&display=swap"
+codeBackgroundColor = "#f7f7f7"
+
+[theme.sidebar]
+backgroundColor = "#fafafa"

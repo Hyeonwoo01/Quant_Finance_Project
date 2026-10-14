@@ -1,0 +1,184 @@
+"""노트북의 검증(assert)들을 그대로 옮긴 자체 테스트.  실행: python tests.py"""
+import numpy as np
+
+from quant_engine import (GarchVolForecaster, GammaScalpingEngine, RiskNeutralPricingEngine,
+                          VolatilityTradingLogic, _straddle_delta, simulate_gbm_paths)
+
+
+def simulate_garch(n, omega, alpha, beta, rng):
+    r, s2 = np.empty(n), omega / (1 - alpha - beta)
+    for t in range(n):
+        r[t] = np.sqrt(s2) * rng.standard_normal()
+        s2 = omega + alpha * r[t] ** 2 + beta * s2
+    return r
+
+
+# 프라이싱 / IV
+engine = RiskNeutralPricingEngine(100.0, 100.0, 1.0, 0.05, 'call')
+put = RiskNeutralPricingEngine(100.0, 100.0, 1.0, 0.05, 'put')
+assert abs(engine.price(0.20) - 10.45) < 0.01
+assert abs(engine.implied_volatility(12.00) - 0.2411) < 1e-3
+assert abs(engine.price(0.2) - put.price(0.2) - (100 - 100 * np.exp(-0.05))) < 1e-10
+assert np.isnan(engine.implied_volatility(101.0)) and np.isnan(engine.implied_volatility(0.5))
+for K in (70, 100, 150):
+    for T in (0.05, 0.5, 2.0):
+        for sg in (0.08, 0.25, 0.9):
+            for typ in ('call', 'put'):
+                e = RiskNeutralPricingEngine(100.0, float(K), T, 0.03, typ)
+                if e.vega(sg) >= 1e-3:
+                    assert abs(e.implied_volatility(e.price(sg)) - sg) < 1e-6
+
+# GARCH 파라미터 복원
+g = GarchVolForecaster().fit(simulate_garch(6000, 4e-6, 0.08, 0.90, np.random.default_rng(3)))
+assert abs(g.persistence - 0.98) < 0.03
+
+# 신호
+logic = VolatilityTradingLogic(vrp=0.028, threshold=0.02)
+assert logic.generate_signal(0.20, 0.23) == 0
+assert logic.generate_signal(0.15, 0.27) == -1
+assert logic.generate_signal(0.28, 0.22) == 1
+
+# 그릭스
+e0 = GammaScalpingEngine(100.0, 100.0, 1.0, 0.05, 0.20)
+h = 1e-5
+v_hi = GammaScalpingEngine(100, 100, 1 + h, 0.05, 0.2).straddle_greeks()["price"]
+v_lo = GammaScalpingEngine(100, 100, 1 - h, 0.05, 0.2).straddle_greeks()["price"]
+assert abs(e0.straddle_greeks()["theta_per_day"] * 252 + (v_hi - v_lo) / (2 * h)) < 1e-6
+assert abs(_straddle_delta(100, 100, 1.0, 0.05, 0.2) - e0.straddle_greeks()["delta"]) < 1e-12
+
+# 벡터화된 헤지 손익 == 경로 하나씩 계산한 값, 그리고 부호가 이론대로인지
+paths = simulate_gbm_paths(100, 0.30, 0.03, 0.25, 63, 50, np.random.default_rng(1))
+sc = GammaScalpingEngine(100, 100, 0.25, 0.03, 0.20)
+vec = sc.hedged_pnl(paths, position=1)
+assert np.allclose(vec, [sc.hedged_pnl(p, position=1) for p in paths])
+assert vec.mean() > 0                                      # 실현 30% > IV 20% → 롱 감마 이익
+assert sc.hedged_pnl(paths, position=-1).mean() < 0
+
+# 방향 예측: 로지스틱이 알려진 관계를 복원하는지
+import pandas as pd
+import direction as dr
+
+rng = np.random.default_rng(7)
+Xs = rng.standard_normal((4000, 3))
+ys = (rng.random(4000) < 1 / (1 + np.exp(-(1.5 * Xs[:, 0] - 1.0 * Xs[:, 1])))).astype(float)
+m = dr.LogisticDirectionModel(l2=1e-6).fit(Xs, ys)
+assert abs(m.w[0] - 1.5) < 0.15 and abs(m.w[1] + 1.0) < 0.15 and abs(m.w[2]) < 0.15
+
+# 워크포워드에 미래 정보가 새지 않는지: T 이후 가격을 바꿔도 T까지의 예측은 그대로여야 한다
+px = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0003, 0.01, 1500))),
+               index=pd.bdate_range("2015-01-01", periods=1500))
+wf_a, _ = dr.walk_forward(px, h=21)
+T = 1200
+px_b = px.copy()
+px_b.iloc[T + 1:] *= np.exp(np.cumsum(rng.normal(0, 0.05, len(px) - T - 1)))
+wf_b, _ = dr.walk_forward(px_b, h=21)
+upto = wf_a.index <= px.index[T]
+assert upto.sum() > 100
+for col in ("auto", "base", "logit_price", "gbm", "ensemble"):     # 자동 선택 포함 모든 후보
+    assert np.allclose(wf_a[col][upto], wf_b[col][upto]), col
+ev = dr.evaluate(wf_a, 21, np.log(px).diff())
+assert 0 <= ev["hit"] <= 1 and len(ev["equity"]) == len(wf_a)
+
+# 파이프라인이 '실제로 예측 가능한' 데이터에선 신호를 찾아내는지 (모멘텀이 있는 합성 가격)
+r = np.zeros(2500)
+for t in range(2500):
+    r[t] = 0.0002 + 0.03 * r[max(0, t - 21):t].sum() + 0.01 * rng.standard_normal()
+px_m = pd.Series(100 * np.exp(np.cumsum(r)), index=pd.bdate_range("2015-01-01", periods=2500))
+wf_m, _ = dr.walk_forward(px_m, h=5)
+ev_m = dr.evaluate(wf_m, 5, np.log(px_m).diff())
+assert ev_m["auc"] > 0.6 and ev_m["skill"] > 0.02 and ev_m["hit"] > ev_m["base"] + 0.02, ev_m["table"]["auto"]
+
+# 대체 데이터: 발표된 정보는 '발표 다음 거래일'부터만 쓰여야 한다
+import alt_data as ad
+
+idx = pd.bdate_range("2024-01-01", periods=10)       # 1/1(월) ~ 1/12(금)
+stamps = pd.DatetimeIndex(["2024-01-03 16:00", "2024-01-05 08:00", "2024-01-06 10:00"], tz="America/New_York")
+pos = ad._effective_pos(idx, stamps)
+assert [idx[p].date().isoformat() for p in pos] == ["2024-01-04", "2024-01-08", "2024-01-08"]  # 장후·장전·주말 발표 모두 다음 거래일
+
+assert ad.headline_score("Apple beats estimates, shares surge") > 0
+assert ad.headline_score("Stock plunges after earnings miss") < 0
+assert ad.headline_score("삼성전자 호실적에 신고가") > 0 and ad.headline_score("반도체 부진 우려에 급락") < 0
+assert ad.headline_score("Company holds annual meeting") == 0
+
+# alt 특징을 넣어도 워크포워드에 미래 정보가 새지 않는지 (T 이후 alt 값만 바꿔 봄)
+alt_a = pd.DataFrame({"eps_surprise": rng.normal(0, 0.1, len(px))}, index=px.index)
+alt_b = alt_a.copy()
+alt_b.iloc[T + 1:] = 5.0
+wa, cols_a = dr.walk_forward(px, 21, alt=alt_a)
+wb, _ = dr.walk_forward(px, 21, alt=alt_b)
+assert "eps_surprise" in cols_a and "logit_alt" in wa
+up_to = wa.index <= px.index[T]
+assert np.allclose(wa["auto"][up_to], wb["auto"][up_to]) and np.allclose(wa["logit_alt"][up_to], wb["logit_alt"][up_to])
+
+# DART 공시: 분류 + '접수일 다음 거래일'부터 반영되는지 (네트워크 없이 공시 목록을 가짜로 주입)
+import kr_data
+
+assert kr_data.classify("주요사항보고서(자기주식취득결정)") == "dart_return"
+assert kr_data.classify("주요사항보고서(유상증자결정)") == "dart_dilution"
+assert kr_data.classify("[기재정정]주요사항보고서(유상증자결정)") is None        # 정정은 세지 않음
+assert kr_data.classify("분기보고서 (2026.06)") == "other"
+fake = pd.DataFrame({"date": pd.to_datetime(["2024-01-03", "2024-01-05"]),
+                     "report": ["주요사항보고서(자기주식취득결정)", "단일판매ㆍ공급계약체결"], "rcept_no": ["1", "2"]})
+orig = kr_data.dart_disclosures
+kr_data.dart_disclosures = lambda code, start, **kw: fake
+try:
+    f = kr_data.dart_features("000000", idx)
+finally:
+    kr_data.dart_disclosures = orig
+assert f.loc["2024-01-03", "dart_return"] == 0 and f.loc["2024-01-04", "dart_return"] == 1   # 1/3 접수 → 1/4부터
+assert f.loc["2024-01-05", "dart_contract"] == 0 and f.loc["2024-01-08", "dart_contract"] == 1
+assert f.loc["2024-01-08", "dart_total"] == 2
+
+# 종목 고르기: 심어 둔 '종목 간' 신호를 찾는지 + T 이후 가격을 바꿔도 T까지의 점수가 그대로인지
+import universe as uv
+
+def synth_panel(seed, n_stock=80, n_day=800, shock_after=None):
+    g = np.random.default_rng(seed)
+    dates = pd.bdate_range("2018-01-01", periods=n_day)
+    sig = np.zeros((n_day, n_stock))
+    for t in range(1, n_day):
+        sig[t] = 0.97 * sig[t - 1] + 0.25 * g.standard_normal(n_stock)       # 천천히 변하는 종목별 신호
+    ret = 0.0015 * sig + 0.02 * g.standard_normal((n_day, n_stock)) + 0.01 * g.standard_normal((n_day, 1))
+    if shock_after is not None:
+        ret[shock_after + 1:] += 0.05 * np.random.default_rng(99).standard_normal((n_day - shock_after - 1, n_stock))
+    codes = [f"{i:06d}" for i in range(n_stock)]
+    close = pd.DataFrame(100 * np.exp(np.cumsum(ret, axis=0)), index=dates, columns=codes)
+    F = {"mom_12_1": pd.DataFrame(np.random.default_rng(seed + 1).standard_normal((n_day, n_stock)), index=dates, columns=codes),
+         "frgn_flow_21": pd.DataFrame(sig, index=dates, columns=codes)}
+    univ = pd.DataFrame(np.repeat(np.arange(n_day)[:, None] >= 260, n_stock, axis=1), index=dates, columns=codes)
+    return {"feat": F, "close": close, "universe": univ, "names": pd.Series(codes, index=codes),
+            "coverage": {"mom_12_1": 1.0, "frgn_flow_21": 1.0}}
+
+pa = synth_panel(5)
+wf_u = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",))
+tab, _ = uv.evaluate(wf_u, cost_bps=0)
+assert tab.loc["ridge", "평균 IC"] > 0.1 and tab.loc["ridge", "상위20% 초과수익(연, 비용후)"] > 0, tab
+assert tab.loc["composite", "평균 IC"] > 0.05            # 고정 가중도 (외국인 수급 + 방향) 신호를 반영
+Tcut = 700                                                # 첫 리밸런싱(512일) 이후 리밸런싱 9회가 비교됨
+pb = synth_panel(5, shock_after=Tcut)
+wf_b = uv.walk_forward(pb, h=21, train_years=1, refit_models=("ridge",))
+cut = pa["close"].index[Tcut]
+for m in ("ridge", "composite", "auto"):
+    sa, sb = wf_u["scores"][m], wf_b["scores"][m]
+    rows = sa.index[sa.index <= cut]
+    assert len(rows) > 5 and np.allclose(sa.loc[rows].values, sb.loc[rows].values, equal_nan=True), m
+
+# 가치 지표: 4분기 = 연간 − (1~3분기), 최근 4분기 합(TTM), 공시 다음 거래일부터 반영
+fin = pd.DataFrame([
+    {"code": "000010", "year": 2023, "q": 1, "rcept_dt": pd.Timestamp("2023-05-15"), "equity": 100.0, "ni": 10.0},
+    {"code": "000010", "year": 2023, "q": 2, "rcept_dt": pd.Timestamp("2023-08-14"), "equity": 100.0, "ni": 10.0},
+    {"code": "000010", "year": 2023, "q": 3, "rcept_dt": pd.Timestamp("2023-11-14"), "equity": 100.0, "ni": 10.0},
+    {"code": "000010", "year": 2023, "q": 4, "rcept_dt": pd.Timestamp("2024-03-15"), "equity": 120.0, "ni": 50.0},
+    {"code": "000010", "year": 2024, "q": 1, "rcept_dt": pd.Timestamp("2024-05-15"), "equity": 125.0, "ni": 5.0},
+])
+vidx = pd.bdate_range("2023-01-02", "2024-06-28")
+vclose = pd.DataFrame({"000010": 10.0}, index=vidx)
+v = kr_data.value_features(fin, vidx, vclose, pd.Series({"000010": 10.0}))    # 시총 = 100
+assert np.isnan(v["ep"].loc["2024-03-15", "000010"])                  # 사업보고서 접수 당일엔 아직 4분기 미확정
+assert abs(v["ep"].loc["2024-03-18", "000010"] - 0.50) < 1e-12         # 10+10+10+(50−30) = 50
+assert abs(v["bm"].loc["2024-03-18", "000010"] - 1.20) < 1e-12
+assert abs(v["ep"].loc["2024-05-16", "000010"] - 0.45) < 1e-12         # 10+10+20+5 = 45
+assert abs(v["roe"].loc["2024-05-16", "000010"] - 45 / 125) < 1e-12
+assert v["bm"].loc["2023-05-15", "000010"] != v["bm"].loc["2023-05-15", "000010"]   # 첫 공시 전엔 NaN
+print("모든 테스트 통과")
