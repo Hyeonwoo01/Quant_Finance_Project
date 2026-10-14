@@ -1,8 +1,11 @@
 """yfinance로 실제 시장 데이터(주가·옵션 체인·금리·배당)를 가져온다."""
+import re
+import time
 from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 import kr_data
@@ -16,6 +19,88 @@ def load_history(ticker, years):
     close = h["Close"].dropna()
     close.index = close.index.tz_localize(None)
     return close
+
+
+_UA = {"User-Agent": "Mozilla/5.0"}
+_MARKETS = {"KOSPI": ("KS", "코스피"), "KOSDAQ": ("KQ", "코스닥")}
+
+
+def kr_symbols(max_age_hours=24):
+    """코스피·코스닥 전 종목(주식·ETF)의 이름 ↔ 티커 표. 네이버 증권에서 받아 하루 동안 캐시한다."""
+    path = kr_data.CACHE / "kr_symbols.pkl"
+    if path.exists() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
+        return pd.read_pickle(path)
+    rows = []
+    for market, (suffix, label) in _MARKETS.items():
+        for page in range(1, 60):
+            js = requests.get(f"https://m.stock.naver.com/api/stocks/marketValue/{market}?page={page}&pageSize=100",
+                              headers=_UA, timeout=10).json()
+            if not js.get("stocks"):
+                break
+            rows += [{"name": s["stockName"], "ticker": f"{s['itemCode']}.{suffix}", "market": label,
+                      "cap": float(s.get("marketValueRaw") or 0)}
+                     for s in js["stocks"] if s.get("stockEndType") in ("stock", "etf")]
+    df = pd.DataFrame(rows).sort_values("cap", ascending=False).drop_duplicates("ticker").reset_index(drop=True)
+    kr_data.CACHE.mkdir(exist_ok=True)
+    df.to_pickle(path)
+    return df
+
+
+def _norm(s):
+    return re.sub(r"\s+", "", str(s)).lower()
+
+
+def search_ticker(query, limit=10):
+    """종목명 또는 티커 → [(티커, 표시 이름), ...] (가장 그럴듯한 순).
+
+    - '005930' / '005930.KS' / 'SPY' 같은 코드는 그대로 (한국 6자리 코드는 시장을 찾아 붙임)
+    - 한글 이름은 코스피·코스닥 목록에서: 정확히 일치 → 앞부분 일치 → 포함, 같은 순위면 시가총액 큰 순
+    - 영문 이름(소문자·공백 포함 등)은 Yahoo Finance 검색
+    """
+    q = str(query or "").strip()
+    if not q:
+        return []
+    m = re.fullmatch(r"(\d{6})(?:\.(KS|KQ))?", q, flags=re.I)
+    if m:
+        code, sfx = m.group(1), (m.group(2) or "").upper()
+        try:
+            hit = kr_symbols().query("ticker.str.startswith(@code)", engine="python")
+        except Exception:
+            hit = pd.DataFrame()
+        if not hit.empty and not sfx:
+            return [(r.ticker, f"{r['name']} ({r.ticker} · {r.market})") for _, r in hit.iterrows()]
+        ticker = f"{code}.{sfx or 'KS'}"
+        name = hit["name"].iloc[0] if not hit.empty else ""
+        return [(ticker, f"{name} ({ticker})" if name else ticker)]
+    if q.isascii():
+        # 'NAVER', 'LG', 'KODEX 200'처럼 영문 이름의 한국 종목: 이름이 정확히 같으면 먼저 보여줌
+        try:
+            table = kr_symbols()
+            kr = table[table["name"].map(_norm) == _norm(q)]
+        except Exception:
+            kr = pd.DataFrame()
+        kr_hits = [(r.ticker, f"{r['name']} ({r.ticker} · {r.market})") for _, r in kr.iterrows()]
+        # 'AAPL', 'BRK-B', '^KS11'처럼 대문자 티커 모양이면 그대로 사용
+        if re.fullmatch(r"[A-Z0-9^.\-=]{1,10}", q):
+            return kr_hits + [(q, f"{q} (미국 등 해외 티커)" if kr_hits else q)]
+        if kr_hits:
+            return kr_hits
+        try:
+            quotes = yf.Search(q, max_results=limit).quotes
+        except Exception:
+            quotes = []
+        out = [(x["symbol"], f"{x.get('shortname') or x.get('longname') or x['symbol']} ({x['symbol']}"
+                f"{' · ' + x['exchDisp'] if x.get('exchDisp') else ''})")
+               for x in quotes if x.get("symbol") and x.get("quoteType") in ("EQUITY", "ETF", "INDEX", None)]
+        return out or [(q.upper(), q.upper())]
+    try:
+        table = kr_symbols()
+    except Exception:
+        return []
+    nq, names = _norm(q), table["name"].map(_norm)
+    rank = np.select([names == nq, names.str.startswith(nq), names.str.contains(nq, regex=False)], [0, 1, 2], 9)
+    hit = table.assign(rank=rank)[rank < 9].sort_values(["rank", "cap"], ascending=[True, False]).head(limit)
+    return [(r.ticker, f"{r['name']} ({r.ticker} · {r.market})") for _, r in hit.iterrows()]
 
 
 def is_us_ticker(ticker):

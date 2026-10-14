@@ -23,6 +23,12 @@ ui.apply()
 
 
 # ---------------- 데이터 (캐시) ----------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_ticker(query):
+    """종목명 또는 티커 → [(티커, 표시 이름)]. 한국 종목 목록은 하루 캐시, 영문 이름은 Yahoo 검색."""
+    return md.search_ticker(query)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_market(ticker, years, horizon):
     close = md.load_history(ticker, years)
@@ -99,7 +105,19 @@ def run_backtest(returns, h, step=10):
 # ---------------- 사이드바 ----------------
 with st.sidebar:
     st.header("설정")
-    ticker = st.text_input("티커", "SPY", help="미국: AAPL, SPY, TSLA … / 한국: 005930.KS (한국 종목은 옵션 데이터 없음)").strip().upper()
+    query = st.text_input("종목명 또는 티커", "SPY",
+                          help="한국: 삼성전자, 에코프로, 005930 / 미국: apple, tesla, AAPL, SPY (한국 개별 종목은 옵션 데이터 없음)")
+    with st.spinner("종목 찾는 중…"):
+        matches = find_ticker(query)
+    if not matches:
+        st.error(f"'{query}'에 해당하는 종목을 찾지 못했어요. 이름을 다르게 쓰거나 종목코드를 입력해 보세요.")
+        st.stop()
+    if len(matches) == 1:
+        ticker = matches[0][0]
+        if matches[0][1] != ticker:
+            st.caption(f"→ {matches[0][1]}")
+    else:
+        ticker = st.selectbox(f"검색 결과 {len(matches)}개", matches, format_func=lambda m: m[1])[0]
     horizon = st.slider("예측 기간 (거래일)", 5, 252, 63, help="21≈1개월, 63≈3개월")
     years = st.slider("학습 데이터 (년)", 2, 10, 3)
     dir_h = st.select_slider("방향 예측 기간 (거래일)", [5, 10, 21, 42, 63], 21, help="이 기간 뒤 주가가 지금보다 높을지 예측")
@@ -194,7 +212,7 @@ with tab1:
                              line=dict(color=ui.NEUTRAL, dash="dot")))
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                       legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     marks = sorted({k for k in (5, 21, 63, 126, 252) if k <= horizon} | {horizon})
     st.dataframe(pd.DataFrame({
@@ -206,7 +224,7 @@ with tab1:
         "95% 상단": [bands[0.95][1][k - 1] for k in marks],
         "예상 변동폭(±1σ)": [f"±{s:.1%}" for s in cum_sd[np.array(marks) - 1]],
     }).style.format({c: "{:,.2f}" for c in ("68% 하단", "68% 상단", "95% 하단", "95% 상단")}),
-        hide_index=True, use_container_width=True)
+        hide_index=True, width="stretch")
 
 # ---------------- 방향 예측 ----------------
 with tab_dir:
@@ -246,7 +264,7 @@ with tab_dir:
             fig = go.Figure(go.Bar(x=cs.values, y=cs.index, orientation="h",
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in cs.values]))
             fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="기여도 (로그오즈)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         if ev is not None:
             with right:
                 st.markdown("**과거 성적표 — 자동 선택 모델** (각 시점에서 그때까지의 데이터로만 학습·선택)")
@@ -269,7 +287,7 @@ with tab_dir:
             } for k, s in ev["table"].items()]).style.format({
                 "오늘 상승 확률": "{:.1%}", "적중률": "{:.1%}", "'항상 상승' 대비": "{:+.1%}",
                 "AUC (0.5=무작위)": "{:.3f}", "Brier 개선": "{:+.1%}"}),
-                hide_index=True, use_container_width=True)
+                hide_index=True, width="stretch")
             share = ", ".join(f"{dr.MODEL_LABELS[k]} {v:.0%}" for k, v in ev["chosen_share"].items())
             st.caption(f"검증 기간 동안 자동 선택된 비율: {share}. "
                        "AUC는 상승/하락을 얼마나 잘 구분하는지(0.5면 동전 던지기), Brier 개선은 확률 정확도가 기본 확률보다 몇 % 좋은지입니다.")
@@ -282,7 +300,7 @@ with tab_dir:
             fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             st.markdown("**상승 확률 추이와 주가** (같은 기간, 위·아래로 나눠 표시)")
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5, 0.5])
@@ -295,7 +313,7 @@ with tab_dir:
             fig.update_yaxes(tickformat=".0%", title_text="상승 확률", row=1, col=1)
             fig.update_yaxes(title_text="종가", row=2, col=1)
             fig.update_layout(height=420, hovermode="x unified", legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 # ---------------- 코스피 종목 고르기 ----------------
 with tab_pick:
@@ -356,7 +374,7 @@ with tab_pick:
                                      line=dict(color=ui.CORAL, dash="dot")))
             fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             st.markdown("**모델 비교** — 모두 같은 워크포워드 조건. ⚠️ 이 표에서 사후에 1등을 고르면 과적합이므로, "
                         "앱은 매 시점 '그때까지의 성적'으로만 고른 **자동 선택**을 씁니다.")
@@ -364,7 +382,7 @@ with tab_pick:
                 "평균 IC": "{:+.3f}", "IC t값": "{:+.1f}", "IC>0 비율": "{:.0%}",
                 "상위20% 초과수익(연, 비용후)": "{:+.1%}", "초과수익 t값": "{:+.1f}",
                 "상위−하위 스프레드(연)": "{:+.1%}", "평균 회전율": "{:.0%}", "리밸런싱 수": "{:.0f}"}, na_rep="—"),
-                hide_index=True, use_container_width=True)
+                hide_index=True, width="stretch")
             share = U["chosen"].value_counts(normalize=True)
             st.caption("자동 선택 비율: " + ", ".join(
                 f"{uv.MODEL_LABELS.get(k, '고르지 않음')} {v:.0%}" for k, v in share.items()) +
@@ -375,22 +393,22 @@ with tab_pick:
             fmt["점수"] = "{:+.3f}"
             with left:
                 st.markdown(f"**상위 20종목** (전체 {U['n_univ']}개 중)")
-                st.dataframe(U["top"].style.format(fmt), use_container_width=True)
+                st.dataframe(U["top"].style.format(fmt), width="stretch")
             with right:
                 st.markdown("**하위 20종목**")
-                st.dataframe(U["bottom"].style.format(fmt), use_container_width=True)
+                st.dataframe(U["bottom"].style.format(fmt), width="stretch")
             st.caption("신호 열은 종목 간 백분위(100% = 그 신호가 가장 큰 종목)입니다. 예: 외국인 순매수 강도 90% = 상위 10% 순매수.")
 
             ic = U["ic"].dropna()
             fig = go.Figure(go.Bar(x=ic.index, y=ic.values,
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in ic.values]))
             fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="리밸런싱별 IC")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             with st.expander("데이터·한계"):
                 cov = pd.Series({uv.FEATURES[c][0]: U["coverage"].get(c, 0) for c in uv.FEATURES})
                 st.markdown("**신호별 데이터 보유율** (30% 미만이면 모델에서 제외)")
-                st.dataframe(cov.to_frame("보유율").style.format("{:.0%}"), use_container_width=True)
+                st.dataframe(cov.to_frame("보유율").style.format("{:.0%}"), width="stretch")
                 st.markdown("""
 - **종목 범위:** 현재 상장된 코스피 보통주 전체 중, 각 과거 시점의 거래대금 상위 200개 (공식 코스피200 구성과는 다름).
   '지금 큰 종목'으로 과거를 고르는 편향은 없앴지만, 그 사이 **상장폐지된 종목은 주가가 없어 빠져 있어**
@@ -438,7 +456,7 @@ with tab_snap:
                 fin = None
             if fin is not None and not fin.empty:
                 st.markdown(f"**{label}**")
-                st.dataframe(fin.style.format("{:,.2f}", na_rep="—"), use_container_width=True)
+                st.dataframe(fin.style.format("{:,.2f}", na_rep="—"), width="stretch")
             else:
                 st.caption(f"{label} 재무 데이터를 불러오지 못했습니다.")
     elif rv is None or rv.empty:
@@ -446,7 +464,7 @@ with tab_snap:
     else:
         fmt = {c: "{:+.2%}" for c in rv.columns if "대비" in c}
         fmt["현재 추정 EPS"] = "{:,.2f}"
-        st.dataframe(rv.style.format(fmt, na_rep="—"), use_container_width=True)
+        st.dataframe(rv.style.format(fmt, na_rep="—"), width="stretch")
         st.caption("추정치가 올라가는 중(+)이면 애널리스트들이 실적 전망을 높이고 있다는 뜻입니다. "
                    "과거 추정치 변경 이력은 무료로 없어서, 과거 검증은 등급·목표가 변경 데이터로 대신합니다.")
 
@@ -458,7 +476,7 @@ with tab_snap:
             recent["분류"] = recent["report"].map(kr_data.classify).map(
                 lambda k: kr_data.DART_FEATURES.get(k, "기타" if k else "정정").split("(")[0])
             recent["링크"] = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + recent["rcept_no"]
-            st.dataframe(recent[["date", "분류", "report", "링크"]], hide_index=True, use_container_width=True,
+            st.dataframe(recent[["date", "분류", "report", "링크"]], hide_index=True, width="stretch",
                          column_config={"date": st.column_config.DateColumn("접수일"), "report": "보고서명",
                                         "링크": st.column_config.LinkColumn("원문", display_text="열기")})
         except Exception as e:
@@ -473,7 +491,7 @@ with tab_snap:
             fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.MINT))
             fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except Exception as e:
             st.caption(f"수급 데이터를 불러오지 못했습니다: {e}")
 
@@ -494,8 +512,8 @@ with tab_snap:
                                marker_color=[ui.POS if v > 0 else ui.NEG if v < 0 else ui.NEUTRAL for v in daily.values]))
         fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="일평균 감성",
                           xaxis_type="category", yaxis_range=[-1, 1])
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(nw[["time", "score", "title", "source", "link"]], hide_index=True, use_container_width=True,
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(nw[["time", "score", "title", "source", "link"]], hide_index=True, width="stretch",
                      column_config={"time": st.column_config.DatetimeColumn("시각", format="MM-DD HH:mm"),
                                     "score": st.column_config.NumberColumn("감성", format="%+.2f"),
                                     "title": "헤드라인", "source": "언론사",
@@ -516,7 +534,7 @@ with tab2:
         fig.add_hline(y=market_iv, line=dict(color=ui.CORAL, dash="dot"), annotation_text=f"시장 IV {market_iv:.1%}")
     fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                       hovermode="x unified", legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     a, b, c, d = st.columns(4)
     a.metric("α (충격 반응)", f"{garch.alpha:.3f}")
     b.metric("β (지속성)", f"{garch.beta:.3f}")
@@ -564,10 +582,10 @@ with tab3:
                          "프리미엄 대비 평균": f"{pnl.mean() / gk['price']:+.1%}"})
             hist.add_trace(go.Histogram(x=pnl, name=name, opacity=0.55, nbinsx=60, marker_color=scen_color[name]))
         st.dataframe(pd.DataFrame(rows).style.format({"평균 손익": "{:+.2f}", "최악": "{:+.2f}", "최선": "{:+.2f}"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         hist.update_layout(barmode="overlay", height=360, xaxis_title="만기 손익 (주가 단위)",
                            margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(hist, use_container_width=True)
+        st.plotly_chart(hist, width="stretch")
         if position == -1:
             st.warning("숏 감마는 예측이 맞으면 꾸준히 벌지만, 실현변동성이 IV를 넘으면 손실이 커집니다. 포지션 한도·손절 필수.")
 
@@ -595,7 +613,7 @@ with tab4:
             fig.add_trace(go.Scatter(x=dates, y=bt["naive"], name="Naive 예측", line=dict(color=ui.NEUTRAL, dash="dot")))
             fig.update_layout(height=380, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.caption(f"검증 시점 {len(bt)}개 (10거래일 간격). 기간이 겹쳐서 표본들이 독립이 아니므로 참고용입니다.")
 
 st.divider()

@@ -180,6 +180,26 @@ assert f_kr.loc[d0, "vix"] == np.log(macro_t["vix"]).loc[:d0].iloc[-2]      # �
 assert f_us.loc[d0, "vix"] == np.log(macro_t["vix"]).loc[d0]                # 미국: 같은 날 값
 assert f_kr.equals(dr.build_features(px_t, macro_t, lag_macro=True))
 
+# 종목명 검색: 정확히 일치 > 앞부분 > 포함, 같은 순위면 시가총액 순 / 코드·티커 입력은 그대로
+import market_data as md
+_fake = pd.DataFrame({"name": ["삼성전자", "삼성전자우", "삼성바이오로직스", "에코프로비엠", "에코프로", "NAVER"],
+                      "ticker": ["005930.KS", "005935.KS", "207940.KS", "247540.KQ", "086520.KQ", "035420.KS"],
+                      "market": ["코스피", "코스피", "코스피", "코스닥", "코스닥", "코스피"],
+                      "cap": [9e14, 5e13, 7e13, 2e13, 1e13, 3e13]})
+_orig_sym = md.kr_symbols
+md.kr_symbols = lambda *a, **k: _fake
+try:
+    assert [t for t, _ in md.search_ticker("삼성전자")] == ["005930.KS", "005935.KS"]
+    assert [t for t, _ in md.search_ticker("삼성")][:2] == ["005930.KS", "207940.KS"]     # 앞부분 일치, 시총 순
+    assert [t for t, _ in md.search_ticker("에코프로")] == ["086520.KQ", "247540.KQ"]      # 정확히 일치가 먼저
+    assert md.search_ticker("247540")[0][0] == "247540.KQ"                                # 코드만 → 시장 찾아 붙임
+    assert md.search_ticker("005930.ks")[0][0] == "005930.KS"
+    assert md.search_ticker("SPY") == [("SPY", "SPY")]
+    assert md.search_ticker("naver")[0][0] == "035420.KS"                                 # 영문 이름 한국 종목
+    assert md.search_ticker("없는회사") == [] and md.search_ticker("  ") == []
+finally:
+    md.kr_symbols = _orig_sym
+
 # 가치 지표: 4분기 = 연간 − (1~3분기), 최근 4분기 합(TTM), 공시 다음 거래일부터 반영
 fin = pd.DataFrame([
     {"code": "000010", "year": 2023, "q": 1, "rcept_dt": pd.Timestamp("2023-05-15"), "equity": 100.0, "ni": 10.0},
