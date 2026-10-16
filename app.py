@@ -122,7 +122,7 @@ with st.sidebar:
     years = st.slider("학습 데이터 (년)", 2, 10, 3, help="변동성 모델이 참고할 과거 기간")
     dir_h = st.select_slider("방향 예측 기간 (거래일)", [5, 10, 21, 42, 63], 21, help="이 기간 뒤 주가가 지금보다 높을지 예측")
     st.subheader("변동성 신호 설정")
-    vrp = st.number_input("옵션 웃돈 (VRP, %p)", 0.0, 20.0, 2.0, 0.5,
+    vrp = st.number_input("VRP (변동성 위험 프리미엄, %p)", 0.0, 20.0, 2.0, 0.5,
                           help="옵션은 보통 실제 변동성보다 조금 비싸게 거래됩니다. 그만큼을 빼고 비교합니다.") / 100
     threshold = st.number_input("관망 구간 (±%p)", 0.0, 20.0, 2.0, 0.5,
                                 help="차이가 이 범위 안이면 매수·매도 신호 없이 '관망'으로 둡니다.") / 100
@@ -175,7 +175,7 @@ def show_hero(dir_metric):
                   f"1년 기준 환산 · 평소 수준 {np.sqrt(garch.long_run_var * 252):.1%}", False),
                  ("시장 기대 변동성 (IV)", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, False),
                  ("변동성 신호", sig_name if signal is not None else "—",
-                  f"{sig_code} · 차이 {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요",
+                  f"{sig_code} · edge {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요",
                   signal is not None and signal != 0),
                  dir_metric],
                 "모든 수치는 그 시점까지의 데이터로만 계산한 추정치이며, 투자 조언이 아닙니다.")
@@ -308,13 +308,13 @@ with tab_dir:
                        "구분력(AUC)은 오를 때와 내릴 때를 얼마나 잘 가르는지(0.5면 동전 던지기), "
                        "확률 정확도 개선은 과거 상승 비율을 그대로 쓸 때보다 확률이 몇 % 더 정확한지입니다.")
 
-            st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 계속 들고 있었을 때와 비교 "
+            st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 단순 보유와 비교 "
                         f"(거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
                         f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f})")
             eq = ev["equity"]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=eq.index, y=eq["전략"], name="50% 넘을 때만 보유", line=dict(color=ui.BLUE)))
-            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="계속 보유", line=dict(color=ui.NEUTRAL)))
+            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
@@ -563,10 +563,10 @@ with tab2:
                       hovermode="x unified", legend=dict(orientation="h", y=1.08))
     ui.chart(fig)
     a, b, c, d = st.columns(4)
-    a.metric("충격 반응 (α)", f"{garch.alpha:.3f}", help="큰 하루 변동이 다음 날 변동성을 얼마나 키우는지")
-    b.metric("지속성 (β)", f"{garch.beta:.3f}", help="높아진 변동성이 얼마나 오래 유지되는지")
-    c.metric("전체 지속성 (α+β)", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
-    d.metric("충격이 절반으로 줄기까지", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
+    a.metric("α (충격 반응)", f"{garch.alpha:.3f}", help="큰 하루 변동이 다음 날 변동성을 얼마나 키우는지")
+    b.metric("β (지속성)", f"{garch.beta:.3f}", help="높아진 변동성이 얼마나 오래 유지되는지")
+    c.metric("α+β", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
+    d.metric("반감기", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
 
 # ---------------- 3. 신호 & 헤지 손익 ----------------
 with tab3:
@@ -577,14 +577,14 @@ with tab3:
         st.warning("이 종목은 옵션 데이터가 없어 신호를 낼 수 없습니다. 사이드바에서 '시장 기대 변동성(IV) 직접 입력'을 켜세요.")
     else:
         edge = logic.edge(rv_opt, market_iv)
-        ui.verdict(f"차이 {edge:+.2%} · 관망 구간 ±{threshold:.1%}", sig_name, "", [(sig_code, "neutral")])
+        ui.verdict(f"edge {edge:+.2%} · 관망 구간 ±{threshold:.1%}", sig_name, "", [(sig_code, "neutral")])
         st.markdown(f"""
 | 항목 | 값 |
 |---|---|
 | 시장 기대 변동성 IV ({iv_note}) | **{market_iv:.2%}** |
-| 모델 예측 변동성 (옵션 만기까지 {opt_days}거래일 평균) | {rv_opt:.2%} |
-| + 옵션 웃돈 (VRP) | {vrp:.2%} |
-| **차이 = IV − (예측 + 웃돈)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
+| GARCH 예측 RV (옵션 만기 {opt_days}거래일 평균) | {rv_opt:.2%} |
+| + VRP | {vrp:.2%} |
+| **edge = IV − (RV + VRP)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
 | 무위험 금리 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
 """)
         position = signal if signal != 0 else st.radio(
@@ -602,8 +602,8 @@ with tab3:
         st.markdown(f"**델타헤지 손익 시뮬레이션** — 스트래들 1개를 사거나 판 뒤 매일 주식으로 방향 위험을 없앴을 때, "
                     f"만기까지의 손익을 상황별로 {n_paths}번씩 가상 실험했습니다 (거래비용 {cost_bps}bp).")
         rng = np.random.default_rng(0)
-        scenarios = [("모델 예측만큼 움직임", rv_opt), ("시장 기대(IV)만큼 움직임", market_iv),
-                     ("기대보다 크게 (×1.5, 급등락장)", 1.5 * market_iv), ("기대보다 작게 (×0.6, 조용한 장)", 0.6 * market_iv)]
+        scenarios = [("GARCH 예측대로", rv_opt), ("IV 수준", market_iv),
+                     ("IV × 1.5 (급등장)", 1.5 * market_iv), ("IV × 0.6 (조용한 장)", 0.6 * market_iv)]
         scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.PURPLE, ui.AMBER]))
         rows, hist = [], go.Figure()
         for name, vol in scenarios:
