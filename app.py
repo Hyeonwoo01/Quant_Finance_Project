@@ -118,18 +118,20 @@ with st.sidebar:
             st.caption(f"→ {matches[0][1]}")
     else:
         ticker = st.selectbox(f"검색 결과 {len(matches)}개", matches, format_func=lambda m: m[1])[0]
-    horizon = st.slider("예측 기간 (거래일)", 5, 252, 63, help="21≈1개월, 63≈3개월")
-    years = st.slider("학습 데이터 (년)", 2, 10, 3)
+    horizon = st.slider("예측 기간 (거래일)", 5, 252, 63, help="주가 범위·변동성을 예측할 기간. 21일 ≈ 1개월, 63일 ≈ 3개월")
+    years = st.slider("학습 데이터 (년)", 2, 10, 3, help="변동성 모델이 참고할 과거 기간")
     dir_h = st.select_slider("방향 예측 기간 (거래일)", [5, 10, 21, 42, 63], 21, help="이 기간 뒤 주가가 지금보다 높을지 예측")
-    st.subheader("신호 파라미터")
-    vrp = st.number_input("VRP (변동성 위험 프리미엄, %p)", 0.0, 20.0, 2.0, 0.5) / 100
-    threshold = st.number_input("관망 구간 ±threshold (%p)", 0.0, 20.0, 2.0, 0.5) / 100
-    manual_iv = st.checkbox("IV 직접 입력 (옵션 데이터 없을 때)")
-    iv_input = st.number_input("시장 IV (%)", 1.0, 300.0, 20.0, 0.5, disabled=not manual_iv) / 100
-    st.subheader("헤지 시뮬레이션")
-    cost_bps = st.number_input("거래비용 (bp)", 0.0, 50.0, 1.0, 0.5)
-    n_paths = st.select_slider("경로 수", [200, 500, 1000, 2000], 500)
-    st.button("🔄 새로고침", on_click=st.cache_data.clear)
+    st.subheader("변동성 신호 설정")
+    vrp = st.number_input("옵션 웃돈 (VRP, %p)", 0.0, 20.0, 2.0, 0.5,
+                          help="옵션은 보통 실제 변동성보다 조금 비싸게 거래됩니다. 그만큼을 빼고 비교합니다.") / 100
+    threshold = st.number_input("관망 구간 (±%p)", 0.0, 20.0, 2.0, 0.5,
+                                help="차이가 이 범위 안이면 매수·매도 신호 없이 '관망'으로 둡니다.") / 100
+    manual_iv = st.checkbox("시장 기대 변동성(IV) 직접 입력", help="옵션 데이터가 없는 종목(한국 개별 종목 등)일 때 켜세요.")
+    iv_input = st.number_input("시장 기대 변동성 IV (%)", 1.0, 300.0, 20.0, 0.5, disabled=not manual_iv) / 100
+    st.subheader("손익 시뮬레이션 설정")
+    cost_bps = st.number_input("거래비용 (bp, 1bp = 0.01%)", 0.0, 50.0, 1.0, 0.5)
+    n_paths = st.select_slider("시뮬레이션 횟수", [200, 500, 1000, 2000], 500)
+    st.button("새로고침", on_click=st.cache_data.clear, width="stretch")
 
 hero_slot = st.empty()
 
@@ -139,12 +141,6 @@ try:
 except Exception as e:
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
-
-with hero_slot.container():
-    ui.hero("변동성 예측 & 트레이딩 신호",
-            "GARCH(1,1)로 앞으로 주가가 움직일 폭을 예측하고, 옵션 내재변동성(IV)과 비교해 변동성 매수·매도 신호를 냅니다. "
-            "방향 예측과 코스피 종목 고르기도 함께 검증합니다.",
-            [("티커", ticker), ("기준일", close.index[-1].date()), ("현재가", f"{spot:,.2f}")])
 
 rets = np.log(close).diff().dropna()
 garch = GarchVolForecaster().fit(rets.values)
@@ -165,6 +161,27 @@ rv_opt = garch.forecast_vol(opt_days)
 
 logic = VolatilityTradingLogic(vrp=vrp, threshold=threshold)
 signal = logic.generate_signal(rv_opt, market_iv) if market_iv is not None else None
+if signal is not None:   # "SHORT_VOL (변동성 매도)" → 코드 / 한글 이름
+    sig_code, sig_name = VolatilityTradingLogic.LABELS[signal].rstrip(")").split(" (")
+
+
+# ---------------- 상단 요약 카드 ----------------
+def show_hero(dir_metric):
+    name = dict(matches).get(ticker, ticker)
+    with hero_slot.container():
+        ui.hero("Volatility · Direction · KOSPI", name, f"{spot:,.2f}", close.pct_change().iloc[-1],
+                [("기준일", close.index[-1].date()), ("학습 데이터", f"{years}년"), ("무위험 금리", f"{r:.2%}")],
+                [(f"예측 변동성 · {horizon}일", f"{rv_h:.1%}",
+                  f"1년 기준 환산 · 평소 수준 {np.sqrt(garch.long_run_var * 252):.1%}", False),
+                 ("시장 기대 변동성 (IV)", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, False),
+                 ("변동성 신호", sig_name if signal is not None else "—",
+                  f"{sig_code} · 차이 {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요",
+                  signal is not None and signal != 0),
+                 dir_metric],
+                "모든 수치는 그 시점까지의 데이터로만 계산한 추정치이며, 투자 조언이 아닙니다.")
+
+
+show_hero((f"{dir_h}일 뒤 상승 확률", "…", "방향 모델 학습 중", False))
 
 try:
     with st.spinner("방향 예측 모델 학습 중…"):
@@ -174,26 +191,19 @@ except Exception as e:
 # 확률 정확도(Brier)가 기본 확률보다 좋고, 적중률 우위가 통계적으로 유의할 때만 '검증 통과'
 reliable = ev is not None and ev["skill"] > 0 and ev["z"] > 2
 
-# ---------------- 요약 지표 ----------------
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("현재가", f"{spot:,.2f}", f"{close.pct_change().iloc[-1]:+.2%} (전일 대비)")
-c2.metric(f"예측 변동성 ({horizon}일 평균, 연율)", f"{rv_h:.1%}",
-          f"장기 평균 {np.sqrt(garch.long_run_var * 252):.1%}", delta_color="off")
-c3.metric("시장 IV", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, delta_color="off")
-c4.metric("신호", VolatilityTradingLogic.LABELS[signal] if signal is not None else "—",
-          f"edge {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요", delta_color="off")
-c5.metric(f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None else "—",
-          ("검증 통과" if reliable else "과거 상승 비율" if pick == "base" else "신뢰도 낮음")
-          if p_up is not None else "데이터 부족", delta_color="off")
+show_hero((f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None else "—",
+           ("과거 검증 통과" if reliable else "과거 상승 비율" if pick == "base" else "과거 검증 미통과 · 참고용")
+           if p_up is not None else "데이터 부족", reliable))
 
 tab1, tab_dir, tab_pick, tab_snap, tab2, tab3, tab4 = st.tabs(
-    ["🎯 주가 예측 범위", "🧭 방향 예측", "🏆 코스피 종목 고르기", "📰 시장 심리", "📊 변동성",
-     "💹 신호 & 헤지 손익", "🧪 예측 정확도 검증"])
+    ["주가 예측 범위", "방향 예측", "코스피 종목 고르기", "시장 심리", "변동성",
+     "신호 & 헤지 손익", "예측 정확도 검증"])
 
 # ---------------- 1. 주가 예측 범위 ----------------
 with tab1:
-    st.info("GARCH 변동성으로 '얼마나 크게 움직일 수 있는지'를 확률 범위로 보여줍니다. 중앙값은 현재가이며, "
-            "오를지/내릴지는 **🧭 방향 예측** 탭에서 따로 봅니다.")
+    ui.section("Price Range Forecast", f"앞으로 {horizon}거래일, 주가가 움직일 범위",
+               "최근 변동성을 바탕으로 주가가 얼마나 크게 움직일 수 있는지 보여줍니다. "
+               "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
     fut_idx = pd.bdate_range(close.index[-1], periods=horizon + 1)[1:]
     bands = {p: (spot * np.exp(-norm.ppf(0.5 + p / 2) * cum_sd), spot * np.exp(norm.ppf(0.5 + p / 2) * cum_sd))
@@ -212,7 +222,7 @@ with tab1:
                              line=dict(color=ui.NEUTRAL, dash="dot")))
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                       legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, width="stretch")
+    ui.chart(fig)
 
     marks = sorted({k for k in (5, 21, 63, 126, 252) if k <= horizon} | {horizon})
     st.dataframe(pd.DataFrame({
@@ -222,7 +232,7 @@ with tab1:
         "68% 상단": [bands[0.68][1][k - 1] for k in marks],
         "95% 하단": [bands[0.95][0][k - 1] for k in marks],
         "95% 상단": [bands[0.95][1][k - 1] for k in marks],
-        "예상 변동폭(±1σ)": [f"±{s:.1%}" for s in cum_sd[np.array(marks) - 1]],
+        "보통 움직임 폭(±1σ)": [f"±{s:.1%}" for s in cum_sd[np.array(marks) - 1]],
     }).style.format({c: "{:,.2f}" for c in ("68% 하단", "68% 상단", "95% 하단", "95% 상단")}),
         hide_index=True, width="stretch")
 
@@ -235,72 +245,79 @@ with tab_dir:
         strength = abs(p_up - 0.5)
         level = ("모델 신호 없음, 과거 상승 비율" if pick == "base" else
                  "강함" if strength >= 0.15 else "보통" if strength >= 0.07 else "약함(거의 동전 던지기)")
-        st.subheader(f"{dir_h}거래일 뒤 예측: **{view}** — 상승 확률 {p_up:.1%} (강도: {level}"
-                     f"{'' if reliable else ' · 과거 검증 미통과'})")
-        st.caption(f"기준일 {dir_asof.date()} · 최대 10년치 일봉 · "
-                   f"사용 모델: **{dr.MODEL_LABELS[pick]}** (최근 3년 실전 성적이 가장 좋은 후보를 자동 선택)")
-        st.caption("모델에 들어간 데이터: 가격 특징 · " + " · ".join(
-            f"{k} {'✅' if v.startswith('사용') else '🔑' if v == '키 없음' else '❌'}" for k, v in alt_status.items()))
+        ui.section("Direction Forecast", f"{dir_h}거래일 뒤, 지금보다 오를까?")
+        ui.verdict(f"기준일 {dir_asof.date()} · 사용 모델 {dr.MODEL_LABELS[pick]}", f"{view} {p_up:.1%}", "상승 확률",
+                   [(f"강도 {level}", "neutral"),
+                    ("과거 검증 통과", "approve") if reliable else ("과거 검증 미통과", "elective")],
+                   "최대 10년치 하루 주가로 여러 모델을 시험해, 최근 3년 동안 가장 잘 맞힌 모델을 골랐습니다.")
+        ui.badges("모델에 들어간 데이터", [("가격 특징 · 사용", "approve")] + [
+            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '없음'}",
+             "approve" if v.startswith("사용") else "neutral" if v == "키 없음" else
+             "reject" if v.startswith("오류") else "neutral") for k, v in alt_status.items()])
         if any(v == "키 없음" for v in alt_status.values()):
-            st.caption("🔑 = API 키가 없어 꺼짐. `vol_predictor/api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
+            st.caption("키 없음 = API 키가 없어 꺼짐. `api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
         errs = {k: v for k, v in alt_status.items() if v.startswith("오류")}
         if errs:
-            st.caption("⚠️ " + " / ".join(f"{k}: {v}" for k, v in errs.items()))
+            st.caption(" / ".join(f"{k}: {v}" for k, v in errs.items()))
 
         if pick == "base":
-            st.info("지금은 어떤 모델도 최근 실전 성적이 '과거 상승 비율을 그대로 쓰는 것'보다 좋지 않아서, "
-                    "상승 확률로 **이 종목의 과거 상승 비율**을 보여주고 있습니다. 근거 없는 신호를 내지 않기 위한 안전장치입니다.")
+            st.info("지금은 어떤 모델도 **이 종목이 과거에 오른 비율**보다 잘 맞히지 못했습니다. "
+                    "그래서 그 비율을 그대로 상승 확률로 보여줍니다. 근거 없는 예측을 내지 않기 위한 장치입니다.")
         if reliable:
-            st.success(f"과거 검증에서 기본 확률보다 확률 정확도가 높고(Brier 개선 {ev['skill']:+.1%}), "
-                       f"적중률 우위도 통계적으로 유의했습니다 (z = {ev['z']:.1f}). 그래도 미래에도 그럴 거란 보장은 없습니다.")
+            st.success(f"과거 검증에서 이 모델은 '항상 오른다'고 보는 것보다 확실히 잘 맞혔습니다 "
+                       f"(확률 정확도 {ev['skill']:+.1%} 개선, 우연일 가능성 낮음 z = {ev['z']:.1f}). "
+                       "그래도 앞으로도 그럴 거라는 보장은 없습니다.")
         else:
-            st.warning(f"과거 검증에서 '항상 상승'보다 **유의미하게 낫지 않았습니다** (z = {ev['z']:.1f}, "
-                       f"Brier 개선 {ev['skill']:+.1%}). 참고용으로만 보세요. 공개 일봉 데이터로 주가 방향은 거의 예측되지 않는 게 정상입니다.")
+            st.warning(f"과거 검증에서 이 모델은 '항상 오른다'고 보는 것보다 **확실히 낫지 않았습니다** "
+                       f"(z = {ev['z']:.1f}, 확률 정확도 {ev['skill']:+.1%}). 참고로만 보세요. "
+                       "공개된 주가만으로 방향을 맞히기는 원래 매우 어렵습니다.")
 
         left, right = st.columns(2)
         with left:
-            st.markdown("**지표별 방향 신호** (오른쪽 = 상승 쪽, 선형 모델 기준 설명용)")
+            st.markdown("**어떤 지표가 상승·하락 쪽으로 기울였나** (오른쪽으로 길수록 상승 쪽, 간단한 모델 기준)")
             cs = contrib.sort_values()
             fig = go.Figure(go.Bar(x=cs.values, y=cs.index, orientation="h",
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in cs.values]))
-            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="기여도 (로그오즈)")
-            st.plotly_chart(fig, width="stretch")
+            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="영향 크기")
+            ui.chart(fig)
         if ev is not None:
             with right:
-                st.markdown("**과거 성적표 — 자동 선택 모델** (각 시점에서 그때까지의 데이터로만 학습·선택)")
+                st.markdown("**과거 성적표** (매 시점 그때까지의 데이터만 써서 예측한 결과)")
                 m1, m2 = st.columns(2)
                 m1.metric("적중률", f"{ev['hit']:.1%}")
-                m2.metric("'항상 상승' 적중률", f"{ev['base']:.1%}",
+                m2.metric("'항상 오른다'고 했을 때", f"{ev['base']:.1%}",
                           f"차이 {ev['hit'] - ev['base']:+.1%}p", delta_color="off")
                 m3, m4 = st.columns(2)
-                m3.metric("Brier 점수 (낮을수록 좋음)", f"{ev['brier']:.3f}",
+                m3.metric("확률 오차 (Brier, 낮을수록 좋음)", f"{ev['brier']:.3f}",
                           f"기준 {ev['brier_base']:.3f}", delta_color="off")
-                m4.metric("검증 표본", f"{ev['n']:,}일", f"실질 독립 표본 ≈ {ev['n_eff']:.0f}", delta_color="off")
+                m4.metric("검증 표본", f"{ev['n']:,}일", f"서로 겹치지 않는 구간 ≈ {ev['n_eff']:.0f}개", delta_color="off")
 
-            st.markdown("**후보 모델 비교** — 모두 같은 워크포워드 조건. ⚠️ 이 표에서 사후에 1등을 고르면 과적합이 되므로, "
-                        "앱은 매 시점 '그때까지의 성적'으로만 고른 **자동 선택** 결과를 씁니다.")
+            st.markdown("**후보 모델 비교** — 모두 같은 조건으로 시험했습니다. 이 표를 보고 나중에 1등을 고르면 성적이 부풀려지므로, "
+                        "앱은 매 시점 그때까지의 성적만 보고 고른 **자동 선택** 결과를 씁니다.")
             st.dataframe(pd.DataFrame([{
-                "모델": dr.MODEL_LABELS.get(k, "⭐ 자동 선택"),
+                "모델": dr.MODEL_LABELS.get(k, "자동 선택"),
                 "오늘 상승 확률": now_all.get(k, p_up),
-                "적중률": s["hit"], "'항상 상승' 대비": s["hit"] - s["base"],
-                "AUC (0.5=무작위)": s["auc"], "Brier 개선": s["skill"],
+                "적중률": s["hit"], "'항상 오른다' 대비": s["hit"] - s["base"],
+                "구분력 AUC (0.5=무작위)": s["auc"], "확률 정확도 개선": s["skill"],
             } for k, s in ev["table"].items()]).style.format({
-                "오늘 상승 확률": "{:.1%}", "적중률": "{:.1%}", "'항상 상승' 대비": "{:+.1%}",
-                "AUC (0.5=무작위)": "{:.3f}", "Brier 개선": "{:+.1%}"}),
+                "오늘 상승 확률": "{:.1%}", "적중률": "{:.1%}", "'항상 오른다' 대비": "{:+.1%}",
+                "구분력 AUC (0.5=무작위)": "{:.3f}", "확률 정확도 개선": "{:+.1%}"}),
                 hide_index=True, width="stretch")
             share = ", ".join(f"{dr.MODEL_LABELS[k]} {v:.0%}" for k, v in ev["chosen_share"].items())
             st.caption(f"검증 기간 동안 자동 선택된 비율: {share}. "
-                       "AUC는 상승/하락을 얼마나 잘 구분하는지(0.5면 동전 던지기), Brier 개선은 확률 정확도가 기본 확률보다 몇 % 좋은지입니다.")
+                       "구분력(AUC)은 오를 때와 내릴 때를 얼마나 잘 가르는지(0.5면 동전 던지기), "
+                       "확률 정확도 개선은 과거 상승 비율을 그대로 쓸 때보다 확률이 몇 % 더 정확한지입니다.")
 
-            st.markdown(f"**'상승 확률 > 50%일 때만 보유' 전략 vs 단순 보유** (거래비용 {cost_bps}bp, "
-                        f"보유 비중 {ev['time_in_market']:.0%}, 샤프 {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f})")
+            st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 계속 들고 있었을 때와 비교 "
+                        f"(거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
+                        f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f})")
             eq = ev["equity"]
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=eq.index, y=eq["전략"], name="모델 전략", line=dict(color=ui.BLUE)))
-            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
+            fig.add_trace(go.Scatter(x=eq.index, y=eq["전략"], name="50% 넘을 때만 보유", line=dict(color=ui.BLUE)))
+            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="계속 보유", line=dict(color=ui.NEUTRAL)))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
             st.markdown("**상승 확률 추이와 주가** (같은 기간, 위·아래로 나눠 표시)")
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5, 0.5])
@@ -313,12 +330,13 @@ with tab_dir:
             fig.update_yaxes(tickformat=".0%", title_text="상승 확률", row=1, col=1)
             fig.update_yaxes(title_text="종가", row=2, col=1)
             fig.update_layout(height=420, hovermode="x unified", legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
 # ---------------- 코스피 종목 고르기 ----------------
 with tab_pick:
-    st.markdown("한 종목의 방향 대신, **코스피 대형주 약 200개를 서로 비교해 앞으로 상대적으로 더 오를 종목**을 고릅니다. "
-                "(위 티커 설정과 무관하게 동작합니다.)")
+    ui.section("KOSPI Ranking", "코스피 대형주 중 상대적으로 더 오를 종목",
+               "한 종목의 방향 대신, 코스피 대형주 약 200개를 서로 비교해 순위를 매깁니다. "
+               "사이드바의 종목 설정과 무관하게 동작합니다.")
     info = uv.data_info()
 
     def run_update():
@@ -337,13 +355,14 @@ with tab_pick:
         c1, c2, c3 = st.columns([2, 1, 1])
         c1.caption(f"데이터 갱신: {info['updated']} · 코스피 {info.get('n_all', '?')}종목 중 "
                    f"과거 200위 이내 진입 {info['n']}종목 · {info['years']}년")
-        hold = c2.selectbox("보유 기간(리밸런싱 주기)", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
-        pick_cost = c3.number_input("거래비용 (편도, bp)", 0.0, 100.0, 15.0, 5.0,
-                                    help="수수료+세금+슬리피지. 국내 주식은 매도세가 있어 편도 10~25bp 정도가 현실적")
-        if st.button("🔄 데이터 업데이트 (새 날짜만 받음)"):
+        hold = c2.selectbox("종목 교체 주기", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
+        pick_cost = c3.number_input("거래비용 (매수·매도 각각, bp)", 0.0, 100.0, 15.0, 5.0,
+                                    help="수수료+세금+체결 가격 차이. 국내 주식은 팔 때 세금이 있어 "
+                                         "10~25bp(0.10~0.25%)가 현실적입니다.")
+        if st.button("데이터 업데이트 (새 날짜만 받음)"):
             run_update()
         try:
-            with st.spinner("워크포워드 학습·검증 중… (처음 1~3분)"):
+            with st.spinner("과거 시점마다 모델을 학습·검증하는 중… (처음 1~3분)"):
                 U = get_universe(hold, pick_cost, info["updated"])
         except Exception as e:
             st.error(f"계산 실패: {e}")
@@ -352,32 +371,33 @@ with tab_pick:
         if U is not None:
             auto = U["table"].loc["auto"]
             ok = auto["초과수익 t값"] > 2 and auto["IC t값"] > 2
-            pick_label = "고르지 않음 (모든 모델 최근 성적 ≤ 0 → 전체 동일가중 권장)" if U["pick"] == "none" \
+            pick_label = "고르지 않음 — 최근 성적이 좋은 모델이 없어, 전체 종목에 똑같이 나눠 담기를 권장" if U["pick"] == "none" \
                 else uv.MODEL_LABELS[U["pick"]]
-            st.subheader(f"{U['date'].date()} 기준 · 사용 모델: {pick_label}")
+            ui.verdict(f"{U['date'].date()} 기준", pick_label, "",
+                       [("과거 검증 통과", "approve") if ok else ("평균보다 낫다고 보기 어려움", "elective")])
             if ok:
-                st.success(f"과거 검증에서 자동 선택 전략이 비용을 빼고도 전체 평균보다 통계적으로 유의하게 더 올랐습니다 "
-                           f"(연 {auto['상위20% 초과수익(연, 비용후)']:+.1%}, t = {auto['초과수익 t값']:.1f}; "
-                           f"IC t = {auto['IC t값']:.1f}). 그래도 미래 성과를 보장하지 않습니다.")
+                st.success(f"과거 검증에서 상위 20% 종목이 비용을 빼고도 전체 평균보다 확실히 더 올랐습니다 "
+                           f"(1년 기준 {auto['상위20% 초과수익(연, 비용후)']:+.1%}, 우연일 가능성 낮음 t = {auto['초과수익 t값']:.1f}, "
+                           f"순위 정확도 t = {auto['IC t값']:.1f}). 그래도 앞으로의 성과를 보장하지 않습니다.")
             else:
-                st.warning(f"과거 검증에서 자동 선택 전략의 초과수익이 통계적으로 유의하지 않았습니다 "
-                           f"(연 {auto['상위20% 초과수익(연, 비용후)']:+.1%}, t = {auto['초과수익 t값']:.1f}; "
-                           f"IC t = {auto['IC t값']:.1f}). 아래 순위는 참고용입니다.")
+                st.warning(f"과거 검증에서 상위 20% 종목이 전체 평균보다 더 올랐다고 확신하기 어렵습니다 "
+                           f"(1년 기준 {auto['상위20% 초과수익(연, 비용후)']:+.1%}, t = {auto['초과수익 t값']:.1f}, "
+                           f"순위 정확도 t = {auto['IC t값']:.1f}; t가 2를 넘어야 우연이 아니라고 봅니다). 아래 순위는 참고로만 보세요.")
 
             cv = U["curves"]
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=cv["auto"].index, y=cv["auto"]["상위 20% (비용 후)"], name="상위 20% (자동 선택, 비용 후)",
+            fig.add_trace(go.Scatter(x=cv["auto"].index, y=cv["auto"]["상위 20% (비용 후)"], name="상위 20% 종목 (비용 뺀 후)",
                                      line=dict(color=ui.BLUE, width=2.5)))
-            fig.add_trace(go.Scatter(x=cv["_universe"].index, y=cv["_universe"], name="전체 동일가중",
+            fig.add_trace(go.Scatter(x=cv["_universe"].index, y=cv["_universe"], name="전체 종목 평균",
                                      line=dict(color=ui.NEUTRAL)))
-            fig.add_trace(go.Scatter(x=cv["auto"].index, y=cv["auto"]["하위 20%"], name="하위 20%",
-                                     line=dict(color=ui.CORAL, dash="dot")))
+            fig.add_trace(go.Scatter(x=cv["auto"].index, y=cv["auto"]["하위 20%"], name="하위 20% 종목",
+                                     line=dict(color=ui.PURPLE, dash="dot")))
             fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
-            st.markdown("**모델 비교** — 모두 같은 워크포워드 조건. ⚠️ 이 표에서 사후에 1등을 고르면 과적합이므로, "
-                        "앱은 매 시점 '그때까지의 성적'으로만 고른 **자동 선택**을 씁니다.")
+            st.markdown("**모델 비교** — 모두 같은 조건으로 시험했습니다. 이 표를 보고 나중에 1등을 고르면 성적이 부풀려지므로, "
+                        "앱은 매 시점 그때까지의 성적만 보고 고른 **자동 선택**을 씁니다.")
             st.dataframe(U["table"].style.format({
                 "평균 IC": "{:+.3f}", "IC t값": "{:+.1f}", "IC>0 비율": "{:.0%}",
                 "상위20% 초과수익(연, 비용후)": "{:+.1%}", "초과수익 t값": "{:+.1f}",
@@ -386,7 +406,8 @@ with tab_pick:
             share = U["chosen"].value_counts(normalize=True)
             st.caption("자동 선택 비율: " + ", ".join(
                 f"{uv.MODEL_LABELS.get(k, '고르지 않음')} {v:.0%}" for k, v in share.items()) +
-                ". IC = 점수 순위와 실제 수익률 순위의 상관(0이면 무관, 0.05면 실무에선 의미 있는 수준).")
+                ". IC(순위 정확도)는 점수 순위와 실제 수익률 순위가 얼마나 일치하는지입니다. "
+                "0이면 무관하고 0.05 정도면 실무에서 의미 있는 수준입니다. t값이 2를 넘으면 우연일 가능성이 낮다고 봅니다.")
 
             left, right = st.columns(2)
             fmt = {c: "{:.0%}" for c in U["top"].columns if c not in ("순위", "종목명", "점수")}
@@ -397,13 +418,13 @@ with tab_pick:
             with right:
                 st.markdown("**하위 20종목**")
                 st.dataframe(U["bottom"].style.format(fmt), width="stretch")
-            st.caption("신호 열은 종목 간 백분위(100% = 그 신호가 가장 큰 종목)입니다. 예: 외국인 순매수 강도 90% = 상위 10% 순매수.")
+            st.caption("신호 열은 전체 종목 중 상대 위치입니다 (100% = 가장 큼). 예: 외국인 순매수 강도 90%면 상위 10%.")
 
             ic = U["ic"].dropna()
             fig = go.Figure(go.Bar(x=ic.index, y=ic.values,
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in ic.values]))
-            fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="리밸런싱별 IC")
-            st.plotly_chart(fig, width="stretch")
+            fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="교체 시점별 순위 정확도(IC)")
+            ui.chart(fig)
 
             with st.expander("데이터·한계"):
                 cov = pd.Series({uv.FEATURES[c][0]: U["coverage"].get(c, 0) for c in uv.FEATURES})
@@ -421,9 +442,10 @@ with tab_pick:
 
 # ---------------- 시장 심리 스냅샷 ----------------
 with tab_snap:
-    st.info("**실적 서프라이즈 · 애널리스트 등급/목표가 · 외국인/기관 수급 · 시장 SKEW**는 과거 기록이 있어서 "
-            "🧭 방향 예측 모델에 들어가 검증됩니다. 아래 **종목 옵션 풋/콜·스큐, EPS 추정치 변경, 뉴스 감성**은 "
-            "무료로는 '현재 값'만 구할 수 있어 과거 검증이 불가능하므로, 모델에 넣지 않고 참고용으로만 보여줍니다.")
+    ui.section("Market Sentiment", "옵션·컨센서스·공시·뉴스 현재 값")
+    st.info("아래 **옵션 풋/콜·스큐, 실적 전망 변화, 뉴스 감성**은 무료로는 지금 값만 구할 수 있어, "
+            "과거에 잘 맞았는지 확인할 수 없습니다. 그래서 예측 모델에는 넣지 않고 참고용으로만 보여줍니다. "
+            "(실적 서프라이즈, 애널리스트 등급·목표가, 외국인·기관 수급, 시장 SKEW는 과거 기록이 있어 방향 예측 모델에 들어갑니다.)")
     with st.spinner("옵션·추정치·뉴스 불러오는 중…"):
         snap = get_snapshot(ticker, spot, r, q)
 
@@ -436,18 +458,19 @@ with tab_snap:
         a.metric("풋/콜 거래량 비율", f"{o['pc_volume']:.2f}", f"풋 {o['put_volume']:,.0f} / 콜 {o['call_volume']:,.0f}",
                  delta_color="off")
         b.metric("풋/콜 미결제약정 비율", f"{o['pc_oi']:.2f}")
-        c.metric("IV 스큐 (90% 풋 − 110% 콜)", f"{o['skew']:+.1%}" if np.isfinite(o["skew"]) else "—",
+        c.metric("스큐 (하락 대비 옵션 − 상승 옵션의 IV)", f"{o['skew']:+.1%}" if np.isfinite(o["skew"]) else "—",
                  f"풋 {o['iv_put90']:.1%} / 콜 {o['iv_call110']:.1%}", delta_color="off")
-        d.metric("ATM IV", f"{o['iv_atm']:.1%}" if np.isfinite(o["iv_atm"]) else "—", f"만기 {o['expiry']} ({o['days']}일)",
+        d.metric("현재가 근처 옵션의 IV", f"{o['iv_atm']:.1%}" if np.isfinite(o["iv_atm"]) else "—", f"만기 {o['expiry']} ({o['days']}일)",
                  delta_color="off")
-        st.caption("풋/콜 비율이 높을수록(보통 1 이상) 하락 대비 수요가 많다는 뜻이지만, 지나치게 높으면 역발상으로 바닥 신호로 보기도 합니다. "
-                   "스큐가 클수록 시장이 하락 위험에 더 높은 값을 매기고 있다는 뜻입니다. 70일 이내 만기 합산, 장 마감 후엔 거래량이 0일 수 있습니다.")
+        st.caption("풋은 하락에 대비하는 옵션, 콜은 상승에 거는 옵션입니다. 풋/콜 비율이 1보다 크면 하락을 걱정하는 사람이 많다는 뜻이지만, "
+                   "너무 높으면 오히려 바닥 신호로 보기도 합니다. 스큐가 클수록 시장이 하락 위험을 더 비싸게 쳐준다는 뜻입니다. "
+                   "만기 70일 이내 옵션을 합산했고, 장 마감 후엔 거래량이 0일 수 있습니다.")
 
-    st.subheader("애널리스트 EPS 추정치")
+    st.subheader("애널리스트 실적(EPS) 전망")
     rv = snap["revisions"]
     code = ad.krx_code(ticker)
     if code:
-        st.caption("한국 종목은 네이버 증권의 실적·컨센서스를 보여줍니다. **(E)** 열이 애널리스트 컨센서스 추정치입니다. "
+        st.caption("한국 종목은 네이버 증권의 실적과 전망치를 보여줍니다. **(E)**가 붙은 열은 애널리스트들의 평균 전망치입니다. "
                    "금액 단위: 억원, 비율: %")
         for label, period in (("분기", "quarter"), ("연간", "annual")):
             try:
@@ -465,8 +488,8 @@ with tab_snap:
         fmt = {c: "{:+.2%}" for c in rv.columns if "대비" in c}
         fmt["현재 추정 EPS"] = "{:,.2f}"
         st.dataframe(rv.style.format(fmt, na_rep="—"), width="stretch")
-        st.caption("추정치가 올라가는 중(+)이면 애널리스트들이 실적 전망을 높이고 있다는 뜻입니다. "
-                   "과거 추정치 변경 이력은 무료로 없어서, 과거 검증은 등급·목표가 변경 데이터로 대신합니다.")
+        st.caption("전망치가 올라가는 중(+)이면 애널리스트들이 실적 기대를 높이고 있다는 뜻입니다. "
+                   "과거 전망 변경 이력은 무료로 구할 수 없어, 과거 검증은 등급·목표가 변경 데이터로 대신합니다.")
 
     if code and kr_data.get_key("DART_API_KEY"):
         st.subheader("최근 공시 (DART)")
@@ -488,10 +511,10 @@ with tab_snap:
             fl = ad.load_investor_flows(code, close.index[-60]).iloc[-60:]
             fig = go.Figure()
             fig.add_trace(go.Bar(x=fl.index, y=fl["frgn"], name="외국인 순매수(주)", marker_color=ui.BLUE))
-            fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.MINT))
+            fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.AMBER))
             fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
         except Exception as e:
             st.caption(f"수급 데이터를 불러오지 못했습니다: {e}")
 
@@ -512,110 +535,121 @@ with tab_snap:
                                marker_color=[ui.POS if v > 0 else ui.NEG if v < 0 else ui.NEUTRAL for v in daily.values]))
         fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="일평균 감성",
                           xaxis_type="category", yaxis_range=[-1, 1])
-        st.plotly_chart(fig, width="stretch")
+        ui.chart(fig)
         st.dataframe(nw[["time", "score", "title", "source", "link"]], hide_index=True, width="stretch",
                      column_config={"time": st.column_config.DatetimeColumn("시각", format="MM-DD HH:mm"),
                                     "score": st.column_config.NumberColumn("감성", format="%+.2f"),
                                     "title": "헤드라인", "source": "언론사",
                                     "link": st.column_config.LinkColumn("링크", display_text="열기")})
-        st.caption("감성 점수는 제목에 나온 금융 긍정/부정 단어를 세는 단순 사전 방식입니다. 반어·맥락은 이해하지 못합니다. "
-                   "과거 뉴스 기록이 무료로 없어 예측력 검증이 불가능합니다.")
+        st.caption("감성 점수는 제목에 나온 긍정·부정 단어를 세는 단순한 방식이라, 반어나 맥락은 이해하지 못합니다. "
+                   "과거 뉴스 기록을 무료로 구할 수 없어 예측에 도움이 되는지는 확인하지 못했습니다.")
 
 # ---------------- 2. 변동성 ----------------
 with tab2:
+    ui.section("Volatility", "실제 변동성 · 모델 추정 · 시장 기대 비교",
+               "회색은 최근 21일 동안 실제로 움직인 폭, 파랑은 GARCH 모델이 추정한 변동성과 앞으로의 예측(점선), "
+               "주황 점선은 옵션 가격에 담긴 시장의 기대(IV)입니다. 모두 1년 기준으로 환산했습니다.")
     rv21 = rets.rolling(21).std() * np.sqrt(252)
     cv = pd.Series(garch.cond_vol, index=rets.index)
     fut_vol = np.sqrt(garch.daily_var_path(horizon) * 252)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=rv21.index, y=rv21, name="21일 실현변동성", line=dict(color=ui.NEUTRAL)))
-    fig.add_trace(go.Scatter(x=cv.index, y=cv, name="GARCH 조건부 변동성", line=dict(color=ui.BLUE)))
-    fig.add_trace(go.Scatter(x=fut_idx, y=fut_vol, name="GARCH 예측 (일별)", line=dict(color=ui.MINT, dash="dash")))
+    fig.add_trace(go.Scatter(x=rv21.index, y=rv21, name="실제 변동성 (최근 21일)", line=dict(color=ui.NEUTRAL)))
+    fig.add_trace(go.Scatter(x=cv.index, y=cv, name="모델 추정 (GARCH)", line=dict(color=ui.BLUE)))
+    fig.add_trace(go.Scatter(x=fut_idx, y=fut_vol, name="모델 예측 (GARCH)", line=dict(color=ui.BLUE, dash="dash")))
     if market_iv is not None:
-        fig.add_hline(y=market_iv, line=dict(color=ui.CORAL, dash="dot"), annotation_text=f"시장 IV {market_iv:.1%}")
+        fig.add_hline(y=market_iv, line=dict(color=ui.AMBER, dash="dot"), annotation_text=f"시장 기대 IV {market_iv:.1%}",
+                      annotation_font_color=ui.INK_80)
     fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                       hovermode="x unified", legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, width="stretch")
+    ui.chart(fig)
     a, b, c, d = st.columns(4)
-    a.metric("α (충격 반응)", f"{garch.alpha:.3f}")
-    b.metric("β (지속성)", f"{garch.beta:.3f}")
-    c.metric("α+β", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
-    d.metric("반감기", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
+    a.metric("충격 반응 (α)", f"{garch.alpha:.3f}", help="큰 하루 변동이 다음 날 변동성을 얼마나 키우는지")
+    b.metric("지속성 (β)", f"{garch.beta:.3f}", help="높아진 변동성이 얼마나 오래 유지되는지")
+    c.metric("전체 지속성 (α+β)", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
+    d.metric("충격이 절반으로 줄기까지", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
 
 # ---------------- 3. 신호 & 헤지 손익 ----------------
 with tab3:
+    ui.section("Signal & Hedge P&L", "변동성 매수·매도 신호와 델타헤지 손익",
+               "옵션 가격에 담긴 시장의 기대 변동성(IV)이 모델 예측보다 충분히 높으면 옵션이 비싸다고 보고 '변동성 매도', "
+               "충분히 낮으면 싸다고 보고 '변동성 매수' 신호를 냅니다.")
     if market_iv is None:
-        st.warning("이 종목은 옵션 데이터가 없어 신호를 낼 수 없습니다. 사이드바에서 'IV 직접 입력'을 켜세요.")
+        st.warning("이 종목은 옵션 데이터가 없어 신호를 낼 수 없습니다. 사이드바에서 '시장 기대 변동성(IV) 직접 입력'을 켜세요.")
     else:
+        edge = logic.edge(rv_opt, market_iv)
+        ui.verdict(f"차이 {edge:+.2%} · 관망 구간 ±{threshold:.1%}", sig_name, "", [(sig_code, "neutral")])
         st.markdown(f"""
 | 항목 | 값 |
 |---|---|
-| 시장 IV ({iv_note}) | **{market_iv:.2%}** |
-| GARCH 예측 RV (옵션 만기 {opt_days}거래일 평균) | {rv_opt:.2%} |
-| + VRP | {vrp:.2%} |
-| **edge = IV − (RV + VRP)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
-| 무위험이자율 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
+| 시장 기대 변동성 IV ({iv_note}) | **{market_iv:.2%}** |
+| 모델 예측 변동성 (옵션 만기까지 {opt_days}거래일 평균) | {rv_opt:.2%} |
+| + 옵션 웃돈 (VRP) | {vrp:.2%} |
+| **차이 = IV − (예측 + 웃돈)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
+| 무위험 금리 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
 """)
-        st.subheader(f"신호: {VolatilityTradingLogic.LABELS[signal]}")
         position = signal if signal != 0 else st.radio(
-            "관망 신호입니다. 시뮬레이션할 포지션을 고르세요:", [1, -1],
+            "지금은 관망 신호입니다. 손익을 시험해 볼 방향을 고르세요:", [1, -1],
             format_func=lambda p: VolatilityTradingLogic.LABELS[p], horizontal=True)
 
         eng = GammaScalpingEngine(spot, spot, opt_T, r, market_iv, q)
         gk = eng.straddle_greeks()
         g1, g2, g3, g4 = st.columns(4)
-        g1.metric("ATM 스트래들 이론가", f"{gk['price']:.2f}")
-        g2.metric("델타", f"{gk['delta']:+.3f}")
-        g3.metric("감마", f"{gk['gamma']:.4f}")
-        g4.metric("세타/일", f"{gk['theta_per_day']:+.3f}")
+        g1.metric("스트래들 이론 가격", f"{gk['price']:.2f}", help="현재가 근처의 콜과 풋을 함께 산 가격")
+        g2.metric("델타", f"{gk['delta']:+.3f}", help="주가가 1 오를 때 스트래들 가격이 변하는 양")
+        g3.metric("감마", f"{gk['gamma']:.4f}", help="주가가 1 오를 때 델타가 변하는 양")
+        g4.metric("하루 시간 가치 감소 (세타)", f"{gk['theta_per_day']:+.3f}")
 
-        st.markdown(f"**델타헤지 손익 몬테카를로** — 스트래들 1단위, 매일 헤지, 비용 {cost_bps}bp, 각 {n_paths}경로")
+        st.markdown(f"**델타헤지 손익 시뮬레이션** — 스트래들 1개를 사거나 판 뒤 매일 주식으로 방향 위험을 없앴을 때, "
+                    f"만기까지의 손익을 상황별로 {n_paths}번씩 가상 실험했습니다 (거래비용 {cost_bps}bp).")
         rng = np.random.default_rng(0)
-        scenarios = [("GARCH 예측대로", rv_opt), ("IV 수준", market_iv),
-                     ("IV × 1.5 (급등장)", 1.5 * market_iv), ("IV × 0.6 (조용한 장)", 0.6 * market_iv)]
-        scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.CORAL, ui.MINT]))
+        scenarios = [("모델 예측만큼 움직임", rv_opt), ("시장 기대(IV)만큼 움직임", market_iv),
+                     ("기대보다 크게 (×1.5, 급등락장)", 1.5 * market_iv), ("기대보다 작게 (×0.6, 조용한 장)", 0.6 * market_iv)]
+        scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.PURPLE, ui.AMBER]))
         rows, hist = [], go.Figure()
         for name, vol in scenarios:
             paths = simulate_gbm_paths(spot, vol, r, opt_T, opt_days, n_paths, rng)
             pnl = eng.hedged_pnl(paths, position=position, cost_bps=cost_bps)
-            rows.append({"시나리오": name, "실현변동성": f"{vol:.1%}", "평균 손익": pnl.mean(),
+            rows.append({"시나리오": name, "실제 변동성": f"{vol:.1%}", "평균 손익": pnl.mean(),
                          "승률": f"{np.mean(pnl > 0):.0%}", "최악": pnl.min(), "최선": pnl.max(),
-                         "프리미엄 대비 평균": f"{pnl.mean() / gk['price']:+.1%}"})
+                         "옵션 가격 대비 평균 손익": f"{pnl.mean() / gk['price']:+.1%}"})
             hist.add_trace(go.Histogram(x=pnl, name=name, opacity=0.55, nbinsx=60, marker_color=scen_color[name]))
         st.dataframe(pd.DataFrame(rows).style.format({"평균 손익": "{:+.2f}", "최악": "{:+.2f}", "최선": "{:+.2f}"}),
                      hide_index=True, width="stretch")
         hist.update_layout(barmode="overlay", height=360, xaxis_title="만기 손익 (주가 단위)",
                            margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(hist, width="stretch")
+        ui.chart(hist)
         if position == -1:
-            st.warning("숏 감마는 예측이 맞으면 꾸준히 벌지만, 실현변동성이 IV를 넘으면 손실이 커집니다. 포지션 한도·손절 필수.")
+            st.warning("변동성 매도는 예측이 맞으면 꾸준히 벌지만, 실제 변동성이 시장 기대(IV)를 넘으면 손실이 크게 날 수 있습니다. "
+                       "포지션 크기를 제한하고 손절 기준을 꼭 정하세요.")
 
 # ---------------- 4. 백테스트 ----------------
 with tab4:
-    st.markdown(f"과거 각 시점에서 **그 시점까지의 데이터만으로** GARCH를 다시 적합해 {horizon}일 변동성을 예측하고, "
-                "이후 실제로 실현된 변동성과 비교합니다. 비교 기준(naive)은 '최근 실현변동성이 그대로 간다'는 예측입니다.")
+    ui.section("Backtest", "GARCH 예측은 과거에 얼마나 맞았나",
+               f"과거 여러 시점에서 그때까지의 데이터만으로 {horizon}일 변동성을 다시 예측하고, 실제로 움직인 폭과 비교합니다. "
+               "비교 대상은 '최근 변동성이 그대로 이어진다'는 단순 예측입니다.")
     if st.button("검증 실행", type="primary"):
-        with st.spinner("여러 시점에서 GARCH 재적합 중…"):
+        with st.spinner("과거 여러 시점에서 다시 예측하는 중…"):
             bt = run_backtest(rets.values, horizon)
         if bt.empty:
             st.warning("데이터가 부족합니다. 학습 데이터 기간을 늘리거나 예측 기간을 줄이세요.")
         else:
             rmse = lambda c: np.sqrt(np.mean((bt[c] - bt["realized"]) ** 2))
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("GARCH 오차 (RMSE)", f"{rmse('garch'):.2%}")
-            m2.metric("Naive 오차 (RMSE)", f"{rmse('naive'):.2%}",
-                      f"GARCH가 {'더 정확' if rmse('garch') < rmse('naive') else '덜 정확'}", delta_color="off")
-            m3.metric("68% 범위 적중률", f"{bt['in1'].mean():.0%}", "이론값 68%", delta_color="off")
-            m4.metric("95% 범위 적중률", f"{bt['in2'].mean():.0%}", "이론값 95%", delta_color="off")
+            m1.metric("모델 예측 오차", f"{rmse('garch'):.2%}", help="RMSE, 작을수록 정확")
+            m2.metric("단순 예측 오차", f"{rmse('naive'):.2%}",
+                      f"모델이 {'더 정확' if rmse('garch') < rmse('naive') else '덜 정확'}", delta_color="off")
+            m3.metric("68% 범위 안에 든 비율", f"{bt['in1'].mean():.0%}", "목표 68%", delta_color="off")
+            m4.metric("95% 범위 안에 든 비율", f"{bt['in2'].mean():.0%}", "목표 95%", delta_color="off")
             dates = rets.index[bt["origin"]]
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=dates, y=bt["realized"], name="실제 실현변동성", line=dict(color=ui.INK)))
-            fig.add_trace(go.Scatter(x=dates, y=bt["garch"], name="GARCH 예측", line=dict(color=ui.BLUE)))
-            fig.add_trace(go.Scatter(x=dates, y=bt["naive"], name="Naive 예측", line=dict(color=ui.NEUTRAL, dash="dot")))
+            fig.add_trace(go.Scatter(x=dates, y=bt["realized"], name="실제 변동성", line=dict(color=ui.INK)))
+            fig.add_trace(go.Scatter(x=dates, y=bt["garch"], name="모델 예측", line=dict(color=ui.BLUE)))
+            fig.add_trace(go.Scatter(x=dates, y=bt["naive"], name="단순 예측", line=dict(color=ui.NEUTRAL, dash="dot")))
             fig.update_layout(height=380, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
-            st.caption(f"검증 시점 {len(bt)}개 (10거래일 간격). 기간이 겹쳐서 표본들이 독립이 아니므로 참고용입니다.")
+            ui.chart(fig)
+            st.caption(f"10거래일 간격으로 {len(bt)}번 검증했습니다. 검증 기간이 서로 겹쳐 있어 결과를 너무 믿지는 마세요.")
 
-st.divider()
-st.caption("⚠️ 교육·연구용입니다. 투자 조언이 아니며, 옵션 데이터(yfinance)는 지연되거나 장 마감 후엔 부정확할 수 있습니다. "
-           "블랙-숄즈는 미국식 옵션에 대한 근사입니다.")
+ui.footer("교육·연구용 고지:", "이 프로그램의 예측과 신호는 과거 데이터로 계산한 참고 자료이며 투자 조언이 아닙니다. "
+          "과거 검증 결과가 미래 성과를 보장하지 않습니다.",
+          "옵션 데이터(yfinance)는 늦게 들어오거나 장 마감 후엔 부정확할 수 있습니다. 옵션 가격 계산(블랙-숄즈)은 만기 전에도 행사할 수 있는 미국식 옵션에는 근사치입니다.")
