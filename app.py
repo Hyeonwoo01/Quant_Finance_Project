@@ -129,7 +129,7 @@ with st.sidebar:
     st.subheader("헤지 시뮬레이션")
     cost_bps = st.number_input("거래비용 (bp)", 0.0, 50.0, 1.0, 0.5)
     n_paths = st.select_slider("경로 수", [200, 500, 1000, 2000], 500)
-    st.button("🔄 새로고침", on_click=st.cache_data.clear)
+    st.button("새로고침", on_click=st.cache_data.clear, width="stretch")
 
 hero_slot = st.empty()
 
@@ -139,12 +139,6 @@ try:
 except Exception as e:
     st.error(f"데이터를 불러오지 못했습니다: {e}")
     st.stop()
-
-with hero_slot.container():
-    ui.hero("변동성 예측 & 트레이딩 신호",
-            "GARCH(1,1)로 앞으로 주가가 움직일 폭을 예측하고, 옵션 내재변동성(IV)과 비교해 변동성 매수·매도 신호를 냅니다. "
-            "방향 예측과 코스피 종목 고르기도 함께 검증합니다.",
-            [("티커", ticker), ("기준일", close.index[-1].date()), ("현재가", f"{spot:,.2f}")])
 
 rets = np.log(close).diff().dropna()
 garch = GarchVolForecaster().fit(rets.values)
@@ -165,6 +159,27 @@ rv_opt = garch.forecast_vol(opt_days)
 
 logic = VolatilityTradingLogic(vrp=vrp, threshold=threshold)
 signal = logic.generate_signal(rv_opt, market_iv) if market_iv is not None else None
+if signal is not None:   # "SHORT_VOL (변동성 매도)" → 코드 / 한글 이름
+    sig_code, sig_name = VolatilityTradingLogic.LABELS[signal].rstrip(")").split(" (")
+
+
+# ---------------- 상단 요약 카드 ----------------
+def show_hero(dir_metric):
+    name = dict(matches).get(ticker, ticker)
+    with hero_slot.container():
+        ui.hero("Volatility · Direction · KOSPI", name, f"{spot:,.2f}", close.pct_change().iloc[-1],
+                [("기준일", close.index[-1].date()), ("학습 데이터", f"{years}년"), ("무위험이자율", f"{r:.2%}")],
+                [(f"예측 변동성 · {horizon}일", f"{rv_h:.1%}",
+                  f"연율 · 장기 평균 {np.sqrt(garch.long_run_var * 252):.1%}", False),
+                 ("시장 IV", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, False),
+                 ("변동성 신호", sig_name if signal is not None else "—",
+                  f"{sig_code} · edge {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요",
+                  signal is not None and signal != 0),
+                 dir_metric],
+                "모든 수치는 그 시점까지의 데이터로만 계산한 추정치이며, 투자 조언이 아닙니다.")
+
+
+show_hero((f"{dir_h}일 뒤 상승 확률", "…", "방향 모델 학습 중", False))
 
 try:
     with st.spinner("방향 예측 모델 학습 중…"):
@@ -174,26 +189,19 @@ except Exception as e:
 # 확률 정확도(Brier)가 기본 확률보다 좋고, 적중률 우위가 통계적으로 유의할 때만 '검증 통과'
 reliable = ev is not None and ev["skill"] > 0 and ev["z"] > 2
 
-# ---------------- 요약 지표 ----------------
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("현재가", f"{spot:,.2f}", f"{close.pct_change().iloc[-1]:+.2%} (전일 대비)")
-c2.metric(f"예측 변동성 ({horizon}일 평균, 연율)", f"{rv_h:.1%}",
-          f"장기 평균 {np.sqrt(garch.long_run_var * 252):.1%}", delta_color="off")
-c3.metric("시장 IV", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, delta_color="off")
-c4.metric("신호", VolatilityTradingLogic.LABELS[signal] if signal is not None else "—",
-          f"edge {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요", delta_color="off")
-c5.metric(f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None else "—",
-          ("검증 통과" if reliable else "과거 상승 비율" if pick == "base" else "신뢰도 낮음")
-          if p_up is not None else "데이터 부족", delta_color="off")
+show_hero((f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None else "—",
+           ("과거 검증 통과" if reliable else "과거 상승 비율" if pick == "base" else "과거 검증 미통과 · 참고용")
+           if p_up is not None else "데이터 부족", reliable))
 
 tab1, tab_dir, tab_pick, tab_snap, tab2, tab3, tab4 = st.tabs(
-    ["🎯 주가 예측 범위", "🧭 방향 예측", "🏆 코스피 종목 고르기", "📰 시장 심리", "📊 변동성",
-     "💹 신호 & 헤지 손익", "🧪 예측 정확도 검증"])
+    ["주가 예측 범위", "방향 예측", "코스피 종목 고르기", "시장 심리", "변동성",
+     "신호 & 헤지 손익", "예측 정확도 검증"])
 
 # ---------------- 1. 주가 예측 범위 ----------------
 with tab1:
-    st.info("GARCH 변동성으로 '얼마나 크게 움직일 수 있는지'를 확률 범위로 보여줍니다. 중앙값은 현재가이며, "
-            "오를지/내릴지는 **🧭 방향 예측** 탭에서 따로 봅니다.")
+    ui.section("Price Range Forecast", f"앞으로 {horizon}거래일, 주가가 움직일 범위",
+               "GARCH 변동성으로 '얼마나 크게 움직일 수 있는지'를 68%·95% 확률 범위로 보여줍니다. "
+               "중앙값은 현재가이며, 오를지 내릴지는 <b>방향 예측</b> 탭에서 따로 봅니다.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
     fut_idx = pd.bdate_range(close.index[-1], periods=horizon + 1)[1:]
     bands = {p: (spot * np.exp(-norm.ppf(0.5 + p / 2) * cum_sd), spot * np.exp(norm.ppf(0.5 + p / 2) * cum_sd))
@@ -212,7 +220,7 @@ with tab1:
                              line=dict(color=ui.NEUTRAL, dash="dot")))
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                       legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, width="stretch")
+    ui.chart(fig)
 
     marks = sorted({k for k in (5, 21, 63, 126, 252) if k <= horizon} | {horizon})
     st.dataframe(pd.DataFrame({
@@ -235,17 +243,20 @@ with tab_dir:
         strength = abs(p_up - 0.5)
         level = ("모델 신호 없음, 과거 상승 비율" if pick == "base" else
                  "강함" if strength >= 0.15 else "보통" if strength >= 0.07 else "약함(거의 동전 던지기)")
-        st.subheader(f"{dir_h}거래일 뒤 예측: **{view}** — 상승 확률 {p_up:.1%} (강도: {level}"
-                     f"{'' if reliable else ' · 과거 검증 미통과'})")
-        st.caption(f"기준일 {dir_asof.date()} · 최대 10년치 일봉 · "
-                   f"사용 모델: **{dr.MODEL_LABELS[pick]}** (최근 3년 실전 성적이 가장 좋은 후보를 자동 선택)")
-        st.caption("모델에 들어간 데이터: 가격 특징 · " + " · ".join(
-            f"{k} {'✅' if v.startswith('사용') else '🔑' if v == '키 없음' else '❌'}" for k, v in alt_status.items()))
+        ui.section("Direction Forecast", f"{dir_h}거래일 뒤, 지금보다 오를까?")
+        ui.verdict(f"기준일 {dir_asof.date()} · 사용 모델 {dr.MODEL_LABELS[pick]}", f"{view} {p_up:.1%}", "상승 확률",
+                   [(f"강도 {level}", "neutral"),
+                    ("과거 검증 통과", "approve") if reliable else ("과거 검증 미통과", "elective")],
+                   "최대 10년치 일봉으로, 최근 3년 실전 성적이 가장 좋은 후보 모델을 자동 선택했습니다.")
+        ui.badges("모델에 들어간 데이터", [("가격 특징 · 사용", "approve")] + [
+            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '없음'}",
+             "approve" if v.startswith("사용") else "neutral" if v == "키 없음" else
+             "reject" if v.startswith("오류") else "neutral") for k, v in alt_status.items()])
         if any(v == "키 없음" for v in alt_status.values()):
-            st.caption("🔑 = API 키가 없어 꺼짐. `vol_predictor/api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
+            st.caption("키 없음 = API 키가 없어 꺼짐. `api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
         errs = {k: v for k, v in alt_status.items() if v.startswith("오류")}
         if errs:
-            st.caption("⚠️ " + " / ".join(f"{k}: {v}" for k, v in errs.items()))
+            st.caption(" / ".join(f"{k}: {v}" for k, v in errs.items()))
 
         if pick == "base":
             st.info("지금은 어떤 모델도 최근 실전 성적이 '과거 상승 비율을 그대로 쓰는 것'보다 좋지 않아서, "
@@ -264,7 +275,7 @@ with tab_dir:
             fig = go.Figure(go.Bar(x=cs.values, y=cs.index, orientation="h",
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in cs.values]))
             fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="기여도 (로그오즈)")
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
         if ev is not None:
             with right:
                 st.markdown("**과거 성적표 — 자동 선택 모델** (각 시점에서 그때까지의 데이터로만 학습·선택)")
@@ -277,10 +288,10 @@ with tab_dir:
                           f"기준 {ev['brier_base']:.3f}", delta_color="off")
                 m4.metric("검증 표본", f"{ev['n']:,}일", f"실질 독립 표본 ≈ {ev['n_eff']:.0f}", delta_color="off")
 
-            st.markdown("**후보 모델 비교** — 모두 같은 워크포워드 조건. ⚠️ 이 표에서 사후에 1등을 고르면 과적합이 되므로, "
+            st.markdown("**후보 모델 비교** — 모두 같은 워크포워드 조건. 이 표에서 사후에 1등을 고르면 과적합이 되므로, "
                         "앱은 매 시점 '그때까지의 성적'으로만 고른 **자동 선택** 결과를 씁니다.")
             st.dataframe(pd.DataFrame([{
-                "모델": dr.MODEL_LABELS.get(k, "⭐ 자동 선택"),
+                "모델": dr.MODEL_LABELS.get(k, "자동 선택"),
                 "오늘 상승 확률": now_all.get(k, p_up),
                 "적중률": s["hit"], "'항상 상승' 대비": s["hit"] - s["base"],
                 "AUC (0.5=무작위)": s["auc"], "Brier 개선": s["skill"],
@@ -300,7 +311,7 @@ with tab_dir:
             fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
             st.markdown("**상승 확률 추이와 주가** (같은 기간, 위·아래로 나눠 표시)")
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.5, 0.5])
@@ -313,12 +324,13 @@ with tab_dir:
             fig.update_yaxes(tickformat=".0%", title_text="상승 확률", row=1, col=1)
             fig.update_yaxes(title_text="종가", row=2, col=1)
             fig.update_layout(height=420, hovermode="x unified", legend=dict(orientation="h", y=1.08))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
 # ---------------- 코스피 종목 고르기 ----------------
 with tab_pick:
-    st.markdown("한 종목의 방향 대신, **코스피 대형주 약 200개를 서로 비교해 앞으로 상대적으로 더 오를 종목**을 고릅니다. "
-                "(위 티커 설정과 무관하게 동작합니다.)")
+    ui.section("KOSPI Ranking", "코스피 대형주 중 상대적으로 더 오를 종목",
+               "한 종목의 방향 대신, 코스피 대형주 약 200개를 서로 비교해 순위를 매깁니다. "
+               "사이드바의 종목 설정과 무관하게 동작합니다.")
     info = uv.data_info()
 
     def run_update():
@@ -340,7 +352,7 @@ with tab_pick:
         hold = c2.selectbox("보유 기간(리밸런싱 주기)", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
         pick_cost = c3.number_input("거래비용 (편도, bp)", 0.0, 100.0, 15.0, 5.0,
                                     help="수수료+세금+슬리피지. 국내 주식은 매도세가 있어 편도 10~25bp 정도가 현실적")
-        if st.button("🔄 데이터 업데이트 (새 날짜만 받음)"):
+        if st.button("데이터 업데이트 (새 날짜만 받음)"):
             run_update()
         try:
             with st.spinner("워크포워드 학습·검증 중… (처음 1~3분)"):
@@ -354,7 +366,8 @@ with tab_pick:
             ok = auto["초과수익 t값"] > 2 and auto["IC t값"] > 2
             pick_label = "고르지 않음 (모든 모델 최근 성적 ≤ 0 → 전체 동일가중 권장)" if U["pick"] == "none" \
                 else uv.MODEL_LABELS[U["pick"]]
-            st.subheader(f"{U['date'].date()} 기준 · 사용 모델: {pick_label}")
+            ui.verdict(f"{U['date'].date()} 기준", pick_label, "",
+                       [("과거 검증 통과", "approve") if ok else ("초과수익 유의하지 않음", "elective")])
             if ok:
                 st.success(f"과거 검증에서 자동 선택 전략이 비용을 빼고도 전체 평균보다 통계적으로 유의하게 더 올랐습니다 "
                            f"(연 {auto['상위20% 초과수익(연, 비용후)']:+.1%}, t = {auto['초과수익 t값']:.1f}; "
@@ -371,12 +384,12 @@ with tab_pick:
             fig.add_trace(go.Scatter(x=cv["_universe"].index, y=cv["_universe"], name="전체 동일가중",
                                      line=dict(color=ui.NEUTRAL)))
             fig.add_trace(go.Scatter(x=cv["auto"].index, y=cv["auto"]["하위 20%"], name="하위 20%",
-                                     line=dict(color=ui.CORAL, dash="dot")))
+                                     line=dict(color=ui.PURPLE, dash="dot")))
             fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
-            st.markdown("**모델 비교** — 모두 같은 워크포워드 조건. ⚠️ 이 표에서 사후에 1등을 고르면 과적합이므로, "
+            st.markdown("**모델 비교** — 모두 같은 워크포워드 조건. 이 표에서 사후에 1등을 고르면 과적합이므로, "
                         "앱은 매 시점 '그때까지의 성적'으로만 고른 **자동 선택**을 씁니다.")
             st.dataframe(U["table"].style.format({
                 "평균 IC": "{:+.3f}", "IC t값": "{:+.1f}", "IC>0 비율": "{:.0%}",
@@ -403,7 +416,7 @@ with tab_pick:
             fig = go.Figure(go.Bar(x=ic.index, y=ic.values,
                                    marker_color=[ui.POS if v > 0 else ui.NEG for v in ic.values]))
             fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="리밸런싱별 IC")
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
 
             with st.expander("데이터·한계"):
                 cov = pd.Series({uv.FEATURES[c][0]: U["coverage"].get(c, 0) for c in uv.FEATURES})
@@ -421,8 +434,9 @@ with tab_pick:
 
 # ---------------- 시장 심리 스냅샷 ----------------
 with tab_snap:
+    ui.section("Market Sentiment", "옵션·컨센서스·공시·뉴스 현재 값")
     st.info("**실적 서프라이즈 · 애널리스트 등급/목표가 · 외국인/기관 수급 · 시장 SKEW**는 과거 기록이 있어서 "
-            "🧭 방향 예측 모델에 들어가 검증됩니다. 아래 **종목 옵션 풋/콜·스큐, EPS 추정치 변경, 뉴스 감성**은 "
+            "방향 예측 모델에 들어가 검증됩니다. 아래 **종목 옵션 풋/콜·스큐, EPS 추정치 변경, 뉴스 감성**은 "
             "무료로는 '현재 값'만 구할 수 있어 과거 검증이 불가능하므로, 모델에 넣지 않고 참고용으로만 보여줍니다.")
     with st.spinner("옵션·추정치·뉴스 불러오는 중…"):
         snap = get_snapshot(ticker, spot, r, q)
@@ -488,10 +502,10 @@ with tab_snap:
             fl = ad.load_investor_flows(code, close.index[-60]).iloc[-60:]
             fig = go.Figure()
             fig.add_trace(go.Bar(x=fl.index, y=fl["frgn"], name="외국인 순매수(주)", marker_color=ui.BLUE))
-            fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.MINT))
+            fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.AMBER))
             fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
         except Exception as e:
             st.caption(f"수급 데이터를 불러오지 못했습니다: {e}")
 
@@ -512,7 +526,7 @@ with tab_snap:
                                marker_color=[ui.POS if v > 0 else ui.NEG if v < 0 else ui.NEUTRAL for v in daily.values]))
         fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="일평균 감성",
                           xaxis_type="category", yaxis_range=[-1, 1])
-        st.plotly_chart(fig, width="stretch")
+        ui.chart(fig)
         st.dataframe(nw[["time", "score", "title", "source", "link"]], hide_index=True, width="stretch",
                      column_config={"time": st.column_config.DatetimeColumn("시각", format="MM-DD HH:mm"),
                                     "score": st.column_config.NumberColumn("감성", format="%+.2f"),
@@ -523,18 +537,21 @@ with tab_snap:
 
 # ---------------- 2. 변동성 ----------------
 with tab2:
+    ui.section("Volatility", "실현 · 조건부 · 내재 변동성 비교",
+               "회색은 지난 21일 실제 변동성, 파랑은 GARCH가 추정한 변동성과 앞으로의 예측(점선)입니다.")
     rv21 = rets.rolling(21).std() * np.sqrt(252)
     cv = pd.Series(garch.cond_vol, index=rets.index)
     fut_vol = np.sqrt(garch.daily_var_path(horizon) * 252)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=rv21.index, y=rv21, name="21일 실현변동성", line=dict(color=ui.NEUTRAL)))
     fig.add_trace(go.Scatter(x=cv.index, y=cv, name="GARCH 조건부 변동성", line=dict(color=ui.BLUE)))
-    fig.add_trace(go.Scatter(x=fut_idx, y=fut_vol, name="GARCH 예측 (일별)", line=dict(color=ui.MINT, dash="dash")))
+    fig.add_trace(go.Scatter(x=fut_idx, y=fut_vol, name="GARCH 예측 (일별)", line=dict(color=ui.BLUE, dash="dash")))
     if market_iv is not None:
-        fig.add_hline(y=market_iv, line=dict(color=ui.CORAL, dash="dot"), annotation_text=f"시장 IV {market_iv:.1%}")
+        fig.add_hline(y=market_iv, line=dict(color=ui.AMBER, dash="dot"), annotation_text=f"시장 IV {market_iv:.1%}",
+                      annotation_font_color=ui.INK_80)
     fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                       hovermode="x unified", legend=dict(orientation="h", y=1.08))
-    st.plotly_chart(fig, width="stretch")
+    ui.chart(fig)
     a, b, c, d = st.columns(4)
     a.metric("α (충격 반응)", f"{garch.alpha:.3f}")
     b.metric("β (지속성)", f"{garch.beta:.3f}")
@@ -543,9 +560,13 @@ with tab2:
 
 # ---------------- 3. 신호 & 헤지 손익 ----------------
 with tab3:
+    ui.section("Signal & Hedge P&L", "변동성 매수·매도 신호와 델타헤지 손익",
+               "시장 IV가 GARCH 예측 변동성 + 위험 프리미엄보다 충분히 높으면 매도, 낮으면 매수 신호입니다.")
     if market_iv is None:
         st.warning("이 종목은 옵션 데이터가 없어 신호를 낼 수 없습니다. 사이드바에서 'IV 직접 입력'을 켜세요.")
     else:
+        edge = logic.edge(rv_opt, market_iv)
+        ui.verdict(f"edge {edge:+.2%} · 관망 구간 ±{threshold:.1%}", sig_name, "", [(sig_code, "neutral")])
         st.markdown(f"""
 | 항목 | 값 |
 |---|---|
@@ -555,7 +576,6 @@ with tab3:
 | **edge = IV − (RV + VRP)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
 | 무위험이자율 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
 """)
-        st.subheader(f"신호: {VolatilityTradingLogic.LABELS[signal]}")
         position = signal if signal != 0 else st.radio(
             "관망 신호입니다. 시뮬레이션할 포지션을 고르세요:", [1, -1],
             format_func=lambda p: VolatilityTradingLogic.LABELS[p], horizontal=True)
@@ -572,7 +592,7 @@ with tab3:
         rng = np.random.default_rng(0)
         scenarios = [("GARCH 예측대로", rv_opt), ("IV 수준", market_iv),
                      ("IV × 1.5 (급등장)", 1.5 * market_iv), ("IV × 0.6 (조용한 장)", 0.6 * market_iv)]
-        scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.CORAL, ui.MINT]))
+        scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.PURPLE, ui.AMBER]))
         rows, hist = [], go.Figure()
         for name, vol in scenarios:
             paths = simulate_gbm_paths(spot, vol, r, opt_T, opt_days, n_paths, rng)
@@ -585,14 +605,15 @@ with tab3:
                      hide_index=True, width="stretch")
         hist.update_layout(barmode="overlay", height=360, xaxis_title="만기 손익 (주가 단위)",
                            margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(hist, width="stretch")
+        ui.chart(hist)
         if position == -1:
             st.warning("숏 감마는 예측이 맞으면 꾸준히 벌지만, 실현변동성이 IV를 넘으면 손실이 커집니다. 포지션 한도·손절 필수.")
 
 # ---------------- 4. 백테스트 ----------------
 with tab4:
-    st.markdown(f"과거 각 시점에서 **그 시점까지의 데이터만으로** GARCH를 다시 적합해 {horizon}일 변동성을 예측하고, "
-                "이후 실제로 실현된 변동성과 비교합니다. 비교 기준(naive)은 '최근 실현변동성이 그대로 간다'는 예측입니다.")
+    ui.section("Backtest", "GARCH 예측은 과거에 얼마나 맞았나",
+               f"과거 각 시점에서 그 시점까지의 데이터만으로 GARCH를 다시 적합해 {horizon}일 변동성을 예측하고, "
+               "이후 실제로 실현된 변동성과 비교합니다. 비교 기준(naive)은 '최근 실현변동성이 그대로 간다'는 예측입니다.")
     if st.button("검증 실행", type="primary"):
         with st.spinner("여러 시점에서 GARCH 재적합 중…"):
             bt = run_backtest(rets.values, horizon)
@@ -613,9 +634,9 @@ with tab4:
             fig.add_trace(go.Scatter(x=dates, y=bt["naive"], name="Naive 예측", line=dict(color=ui.NEUTRAL, dash="dot")))
             fig.update_layout(height=380, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            st.plotly_chart(fig, width="stretch")
+            ui.chart(fig)
             st.caption(f"검증 시점 {len(bt)}개 (10거래일 간격). 기간이 겹쳐서 표본들이 독립이 아니므로 참고용입니다.")
 
-st.divider()
-st.caption("⚠️ 교육·연구용입니다. 투자 조언이 아니며, 옵션 데이터(yfinance)는 지연되거나 장 마감 후엔 부정확할 수 있습니다. "
-           "블랙-숄즈는 미국식 옵션에 대한 근사입니다.")
+ui.footer("교육·연구용 고지:", "이 프로그램의 예측과 신호는 과거 데이터로 계산한 참고 자료이며 투자 조언이 아닙니다. "
+          "과거 검증 결과가 미래 성과를 보장하지 않습니다.",
+          "옵션 데이터(yfinance)는 지연되거나 장 마감 후엔 부정확할 수 있으며, 블랙-숄즈는 미국식 옵션에 대한 근사입니다.")
