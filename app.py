@@ -308,13 +308,13 @@ with tab_dir:
                        "구분력(AUC)은 오를 때와 내릴 때를 얼마나 잘 가르는지(0.5면 동전 던지기), "
                        "확률 정확도 개선은 과거 상승 비율을 그대로 쓸 때보다 확률이 몇 % 더 정확한지입니다.")
 
-            st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 계속 들고 있었을 때와 비교 "
+            st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 단순 보유와 비교 "
                         f"(거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
                         f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f})")
             eq = ev["equity"]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=eq.index, y=eq["전략"], name="50% 넘을 때만 보유", line=dict(color=ui.BLUE)))
-            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="계속 보유", line=dict(color=ui.NEUTRAL)))
+            fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
@@ -602,8 +602,8 @@ with tab3:
         st.markdown(f"**델타헤지 손익 시뮬레이션** — 스트래들 1개를 사거나 판 뒤 매일 주식으로 방향 위험을 없앴을 때, "
                     f"만기까지의 손익을 상황별로 {n_paths}번씩 가상 실험했습니다 (거래비용 {cost_bps}bp).")
         rng = np.random.default_rng(0)
-        scenarios = [("모델 예측만큼 움직임", rv_opt), ("시장 기대(IV)만큼 움직임", market_iv),
-                     ("기대보다 크게 (×1.5, 급등락장)", 1.5 * market_iv), ("기대보다 작게 (×0.6, 조용한 장)", 0.6 * market_iv)]
+        scenarios = [("GARCH 예측대로", rv_opt), ("IV 수준", market_iv),
+                     ("IV × 1.5 (급등장)", 1.5 * market_iv), ("IV × 0.6 (조용한 장)", 0.6 * market_iv)]
         scen_color = dict(zip([s[0] for s in scenarios], [ui.BLUE, ui.NEUTRAL, ui.PURPLE, ui.AMBER]))
         rows, hist = [], go.Figure()
         for name, vol in scenarios:
