@@ -301,24 +301,96 @@ def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, 
     return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
 
 
+def _strategy_stats(pos, bt, h=21):
+    """진입별 포지션(+1 매수 / −1 매도 / 0 쉼) → 성적 요약과 자산 곡선 (주가 1주당 스트래들 1개 기준)."""
+    ret = pos * bt["long"] - pos.abs() * bt["cost"]
+    traded = pos != 0
+    rt, n = ret[traded], int(traded.sum())
+    return {"거래 수": n, "승률": (rt > 0).mean() if n else np.nan,
+            "평균 손익(주가 대비)": rt.mean() if n else np.nan,
+            "평균 손익(프리미엄 대비)": (rt / bt["premium"][traded]).mean() if n else np.nan,
+            "t값": rt.mean() / rt.std() * np.sqrt(n) if n > 2 and rt.std() > 0 else np.nan,
+            "샤프(연)": ret.mean() / ret.std() * np.sqrt(252 / h) if ret.std() > 0 else np.nan,
+            "최대 낙폭": max_drawdown((1 + ret).cumprod()), "최악 1회": rt.min() if n else np.nan}, (1 + ret).cumprod()
+
+
 def summarize_vol_backtest(bt, h=21):
     """세 전략(신호대로 / 항상 매도 / 항상 매수)의 거래별 손익 요약 + 자산 곡선."""
-    per_year = 252 / h
     rows, curves = {}, {}
     for key, name in VOL_STRATEGIES.items():
         pos = bt["signal"] if key == "signal" else pd.Series(-1 if key == "short" else 1, index=bt.index)
-        ret = pos * bt["long"] - pos.abs() * bt["cost"]          # 주가 1주당 스트래들 1개 기준 수익률
-        traded = pos != 0
-        rt = ret[traded]
-        n = int(traded.sum())
-        rows[key] = {"전략": name, "거래 수": n, "승률": (rt > 0).mean() if n else np.nan,
-                     "평균 손익(주가 대비)": rt.mean() if n else np.nan,
-                     "평균 손익(프리미엄 대비)": (rt / bt["premium"][traded]).mean() if n else np.nan,
-                     "t값": rt.mean() / rt.std() * np.sqrt(n) if n > 2 and rt.std() > 0 else np.nan,
-                     "샤프(연)": ret.mean() / ret.std() * np.sqrt(per_year) if ret.std() > 0 else np.nan,
-                     "최대 낙폭": max_drawdown((1 + ret).cumprod()), "최악 1회": rt.min() if n else np.nan}
-        curves[name] = (1 + ret).cumprod()
+        stats, curves[name] = _strategy_stats(pos, bt, h)
+        rows[key] = {"전략": name, **stats}
     return pd.DataFrame(rows).T, pd.DataFrame(curves)
+
+
+def add_combined_forecast(bt, min_train=24):
+    """IV를 예측에 같이 쓰는 두 가지 예측을 워크포워드로 추가한다.
+
+    combo: 실제 변동성 ≈ a + b·GARCH + c·IV 를 '이미 결과가 나온 과거 진입들'로만 최소제곱 추정해 예측.
+    iv_adj: IV − (과거 진입들의 평균 VRP).
+    진입이 h일 간격이라 직전 진입의 결과(이후 h일 실제 변동성)는 다음 진입일 종가에 확정된다.
+    """
+    out = bt.copy()
+    g, iv, rv = bt["garch"].values, bt["iv"].values, bt["realized"].values
+    combo, adj = np.full(len(bt), np.nan), np.full(len(bt), np.nan)
+    for k in range(min_train, len(bt)):
+        coef = np.linalg.lstsq(np.column_stack([np.ones(k), g[:k], iv[:k]]), rv[:k], rcond=None)[0]
+        combo[k] = max(coef @ np.array([1.0, g[k], iv[k]]), 0.01)
+        adj[k] = iv[k] - np.mean(iv[:k] - rv[:k])
+    out["combo"], out["iv_adj"] = combo, adj
+    return out
+
+
+def forecast_errors(bt, iv_name="IV"):
+    """같은 진입들(결합 예측이 있는 구간)에서 각 예측의 실제 변동성 대비 오차. 모두 표본 밖 예측이다.
+
+    'GARCH 대비 개선 t값': (GARCH 오차² − 이 예측 오차²)의 평균이 0보다 큰지 (디볼드-마리아노 검정, 2를 넘으면 우연이 아님).
+    """
+    d = bt.dropna(subset=["combo"])
+    labels = {"garch": "GARCH", "iv": f"{iv_name} 그대로", "iv_adj": f"{iv_name} − 과거 평균 VRP",
+              "combo": f"GARCH + {iv_name} 결합"}
+    e_g = d["garch"] - d["realized"]
+    rows = {}
+    for c, name in labels.items():
+        e = d[c] - d["realized"]
+        diff = e_g**2 - e**2
+        rows[name] = {"예측 오차(RMSE)": float(np.sqrt(np.mean(e**2))), "평균 치우침": float(e.mean()),
+                      "GARCH 대비 개선 t값": (float(diff.mean() / diff.std() * np.sqrt(len(d)))
+                                          if c != "garch" and diff.std() > 0 else np.nan)}
+    return pd.DataFrame(rows).T, len(d)
+
+
+SHORT_CUTOFFS = (-0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05)
+
+
+def short_only_split(bt, h=21, cutoffs=SHORT_CUTOFFS, iv_name="IV", min_rows=24):
+    """'매도만' 규칙을 앞 절반에서 고르고(앞 기간 샤프가 가장 높은 것) 뒤 절반에서 검증한다.
+
+    후보: 항상 매도, 그리고 (예측 = GARCH 또는 GARCH+IV 결합) × (IV − 예측 > 기준이면 그달 매도, 아니면 쉼).
+    뒤 절반은 규칙을 고를 때 전혀 쓰지 않으므로 '처음 보는 데이터'에서의 성적이다.
+    bt에는 add_combined_forecast의 combo 열이 있어야 한다. 표본이 min_rows보다 적으면 None.
+    """
+    d = bt.dropna(subset=["combo"])
+    if len(d) < min_rows:
+        return None
+    half = len(d) // 2
+    train, test = d.iloc[:half], d.iloc[half:]
+    rules = {"항상 매도": lambda x: pd.Series(-1.0, index=x.index)}
+    for f, fname in (("garch", "GARCH"), ("combo", f"GARCH+{iv_name} 결합")):
+        for c in cutoffs:
+            rules[f"매도만 · {fname} 예측 · 기준 {c * 100:+.0f}%p"] = (
+                lambda x, f=f, c=c: -((x["iv"] - x[f]) > c).astype(float))
+    cand = {name: _strategy_stats(rule(train), train, h)[0] for name, rule in rules.items()}
+    cand = pd.DataFrame({k: {"앞 기간 샤프": v["샤프(연)"], "앞 기간 거래 수": v["거래 수"],
+                             "앞 기간 평균 손익(주가 대비)": v["평균 손익(주가 대비)"]} for k, v in cand.items()}).T
+    chosen = cand["앞 기간 샤프"].astype(float).idxmax()
+    rows, curves = {}, {}
+    for name, pos in (("고른 규칙", rules[chosen](test)), ("항상 매도", rules["항상 매도"](test)),
+                      ("GARCH 신호대로 (사이드바 설정)", test["signal"].astype(float))):
+        rows[name], curves[name] = _strategy_stats(pos, test, h)
+    return {"candidates": cand, "chosen": chosen, "test": pd.DataFrame(rows).T, "curves": pd.DataFrame(curves),
+            "train_period": (train.index[0], train.index[-1]), "test_period": (test.index[0], test.index[-1])}
 
 
 def simulate_gbm_paths(S0, vol, r, T, n_steps, n_paths, rng):

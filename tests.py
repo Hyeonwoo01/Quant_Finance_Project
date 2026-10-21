@@ -267,6 +267,39 @@ vb2 = vol_signal_backtest(_px2, _iv, vrp=0.0, threshold=0.02, h=21, cost_bps=1.0
 done = [d for i, d in enumerate(vb.index) if _idx.get_loc(d) + 21 < 1000]      # 결과까지 T 이전에 끝난 거래
 assert len(done) > 10 and np.allclose(vb.loc[done].values, vb2.loc[done].values)
 
+# IV 결합 예측: 과거 결과만 쓰는지 + 실제가 GARCH·IV의 섞임이면 결합이 둘 다보다 정확해야
+from quant_engine import add_combined_forecast, forecast_errors, short_only_split
+_rng = np.random.default_rng(31)
+_k = 120
+_g = 0.15 + 0.05 * _rng.standard_normal(_k)
+_ivv = 0.18 + 0.05 * _rng.standard_normal(_k)
+_bt = pd.DataFrame({"garch": _g, "iv": _ivv, "realized": 0.5 * _g + 0.5 * _ivv - 0.02 + 0.01 * _rng.standard_normal(_k),
+                    "signal": 0, "long": 0.0, "cost": 0.0, "premium": 0.05},
+                   index=pd.bdate_range("2015-01-01", periods=_k, freq="21B"))
+cb = add_combined_forecast(_bt)
+assert cb["combo"].iloc[:24].isna().all() and cb["combo"].iloc[24:].notna().all()
+_bt2 = _bt.copy()
+_bt2.iloc[80:, _bt2.columns.get_loc("realized")] = 9.9             # 80번째 이후 결과만 바꿈
+cb2 = add_combined_forecast(_bt2)
+assert np.allclose(cb["combo"].iloc[24:81], cb2["combo"].iloc[24:81]) and np.allclose(cb["iv_adj"].iloc[24:81], cb2["iv_adj"].iloc[24:81])
+fe, n_fe = forecast_errors(cb, "VIX")
+assert n_fe == _k - 24 and fe["예측 오차(RMSE)"].idxmin() == "GARCH + VIX 결합", fe
+assert fe.loc["GARCH + VIX 결합", "GARCH 대비 개선 t값"] > 2 and np.isnan(fe.loc["GARCH", "GARCH 대비 개선 t값"])
+
+# '매도만' 규칙: IV가 예측보다 비쌀 때만 팔면 이익인 데이터에서 그 규칙을 골라야 하고, 뒤 기간은 선택에 안 쓰여야 한다
+_spread = _rng.uniform(-0.04, 0.06, _k)
+_bs = pd.DataFrame({"garch": _g, "iv": _g + _spread, "realized": _g + 0.005 * _rng.standard_normal(_k),
+                    "signal": 0, "cost": 0.0, "premium": 0.05}, index=_bt.index)
+_bs["long"] = 0.5 * (_bs["realized"] - _bs["iv"])                  # 롱 스트래들 손익 ≈ 베가 × (실제 − IV)
+so = short_only_split(add_combined_forecast(_bs), iv_name="VIX")
+assert so["chosen"] != "항상 매도" and so["chosen"].endswith(("기준 -1%p", "기준 +0%p", "기준 +1%p")), so["chosen"]   # 참 기준선 ≈ 0
+assert so["test"].loc["고른 규칙", "샤프(연)"] > so["test"].loc["항상 매도", "샤프(연)"]
+_bs2 = _bs.copy()
+_half = 24 + (_k - 24) // 2
+_bs2.iloc[_half:, _bs2.columns.get_loc("long")] *= -1                # 뒤 기간 손익만 뒤집음
+assert short_only_split(add_combined_forecast(_bs2), iv_name="VIX")["chosen"] == so["chosen"]
+assert short_only_split(add_combined_forecast(_bs.iloc[:40]), iv_name="VIX") is None   # 표본 부족
+
 # ---------------- 시장 국면 ----------------
 _rng = np.random.default_rng(7)
 _n = 3000
