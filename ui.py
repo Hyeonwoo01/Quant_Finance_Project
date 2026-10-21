@@ -47,8 +47,10 @@ header[data-testid="stHeader"] {{ background: #000; height: 44px; min-height: 44
 header[data-testid="stHeader"]::before {{
     content: "Quant Finance"; position: absolute; left: 50%; top: 0; transform: translateX(-50%);
     line-height: 44px; color: #fff; font: 600 14px/44px {FONT}; letter-spacing: -0.2px; pointer-events: none; }}
+/* 아이콘은 글자색(currentColor)을 따르므로 color만 바꾼다 — fill을 직접 칠하면 투명 배경 사각형까지 흰 네모가 됨 */
 header[data-testid="stHeader"] button, header[data-testid="stHeader"] a,
-header[data-testid="stHeader"] [data-testid="stToolbar"] *, header[data-testid="stHeader"] svg {{ color: #fff !important; fill: currentColor; }}
+header[data-testid="stHeader"] [data-testid="stToolbar"] {{ color: #fff !important; }}
+header[data-testid="stHeader"] [data-testid="stStatusWidget"] svg {{ color: rgba(255,255,255,.7) !important; }}
 header[data-testid="stHeader"] [data-testid="stDecoration"] {{ display: none; }}
 
 /* 제목: 600 + 음수 자간 */
