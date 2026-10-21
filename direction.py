@@ -18,6 +18,7 @@ from sklearn.metrics import roc_auc_score
 
 import alt_data
 import market_data
+from quant_engine import max_drawdown
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
@@ -293,6 +294,7 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0):
     (sm, ss), (bm, bs) = ann(strat), ann(nxt)
     return {**table["auto"], "table": table, "equity": equity, "time_in_market": float(pos.mean()),
             "sharpe": sm / ss if ss > 0 else 0.0, "sharpe_bh": bm / bs if bs > 0 else 0.0,
+            "mdd": max_drawdown(equity["전략"]), "mdd_bh": max_drawdown(equity["단순 보유"]),
             "chosen_share": wf["chosen"].value_counts(normalize=True)}
 
 

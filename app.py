@@ -7,16 +7,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
-from scipy.stats import norm
 
 import alt_data as ad
 import direction as dr
 import kr_data
 import market_data as md
+import regime as rg
 import ui
 import universe as uv
-from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic,
-                          simulate_gbm_paths)
+from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, max_drawdown,
+                          simulate_gbm_paths, summarize_vol_backtest, var_es, vol_signal_backtest)
 
 st.set_page_config(page_title="변동성 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -86,9 +86,30 @@ def get_universe(h, cost_bps, data_stamp):
             "n_univ": n_univ}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q):
+    """변동성 지수(VIX 등)를 과거 IV로 써서 변동성 신호를 워크포워드 검증 (최대 10년). 지수가 없으면 None."""
+    iv = md.load_vol_index(ticker, 10)
+    if iv is None:
+        return None
+    bt = vol_signal_backtest(md.load_history(ticker, 10), iv, vrp, threshold, cost_bps=cost_bps, r=r, q=q)
+    if bt.empty:
+        raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 2년 필요)")
+    return (bt, *summarize_vol_backtest(bt))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_regime(ticker, cost_bps):
+    """국면 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
+    return rg.analyze(md.load_history(ticker, 10), cost_bps)
+
+
 @st.cache_data(show_spinner=False)
 def run_backtest(returns, h, step=10):
-    """과거 여러 시점에서 '그때까지 데이터만으로' 예측 → 이후 실제와 비교 (look-ahead 없음)."""
+    """과거 여러 시점에서 '그때까지 데이터만으로' 예측 → 이후 실제와 비교 (look-ahead 없음).
+
+    범위·VaR는 앱 화면과 같은 방식(t분포 GARCH 시뮬레이션의 분위수)으로 판정한다.
+    """
     r = np.asarray(returns)
     start = max(250, len(r) - 500)
     rows = []
@@ -97,9 +118,10 @@ def run_backtest(returns, h, step=10):
         f = g.forecast_vol(h)
         real = np.sqrt(np.mean(r[o:o + h] ** 2) * 252)
         naive = np.sqrt(np.mean(r[o - max(h, 21):o] ** 2) * 252)
-        move = r[o:o + h].sum() / (f * np.sqrt(h / 252))      # 표준화된 실제 움직임
-        rows.append((o, f, naive, real, abs(move) <= 1, abs(move) <= 2))
-    return pd.DataFrame(rows, columns=["origin", "garch", "naive", "realized", "in1", "in2"])
+        q05, q025, q16, q84, q975 = np.quantile(g.simulate(h, 2000, seed=o)[:, -1], [0.05, 0.025, 0.16, 0.84, 0.975])
+        move = r[o:o + h].sum()
+        rows.append((o, f, naive, real, q16 <= move <= q84, q025 <= move <= q975, move < q05))
+    return pd.DataFrame(rows, columns=["origin", "garch", "naive", "realized", "in1", "in2", "var_breach"])
 
 
 # ---------------- 사이드바 ----------------
@@ -195,19 +217,21 @@ show_hero((f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None el
            ("과거 검증 통과" if reliable else "과거 상승 비율" if pick == "base" else "과거 검증 미통과 · 참고용")
            if p_up is not None else "데이터 부족", reliable))
 
-tab1, tab_dir, tab_pick, tab_snap, tab2, tab3, tab4 = st.tabs(
-    ["주가 예측 범위", "방향 예측", "코스피 종목 고르기", "시장 심리", "변동성",
+tab1, tab_dir, tab_pick, tab_snap, tab2, tab_regime, tab3, tab4 = st.tabs(
+    ["주가 예측 범위", "방향 예측", "코스피 종목 고르기", "시장 심리", "변동성", "시장 국면",
      "신호 & 헤지 손익", "예측 정확도 검증"])
 
 # ---------------- 1. 주가 예측 범위 ----------------
 with tab1:
     ui.section("Price Range Forecast", f"앞으로 {horizon}거래일, 주가가 움직일 범위",
                "최근 변동성을 바탕으로 주가가 얼마나 크게 움직일 수 있는지 보여줍니다. "
-               "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
+               "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 폭락·폭등이 정규분포보다 자주 나오는 점을 "
+               "t분포 GARCH로 반영해 1만 번 시뮬레이션했습니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
     fut_idx = pd.bdate_range(close.index[-1], periods=horizon + 1)[1:]
-    bands = {p: (spot * np.exp(-norm.ppf(0.5 + p / 2) * cum_sd), spot * np.exp(norm.ppf(0.5 + p / 2) * cum_sd))
-             for p in (0.68, 0.95)}
+    sims = garch.simulate(horizon)                                  # (경로, 일) 누적 로그수익률
+    qs = spot * np.exp(np.quantile(sims, [0.025, 0.16, 0.84, 0.975], axis=0))
+    bands = {0.68: (qs[1], qs[2]), 0.95: (qs[0], qs[3])}
 
     show = close.iloc[-min(len(close), max(252, 3 * horizon)):]
     fig = go.Figure()
@@ -235,6 +259,22 @@ with tab1:
         "보통 움직임 폭(±1σ)": [f"±{s:.1%}" for s in cum_sd[np.array(marks) - 1]],
     }).style.format({c: "{:,.2f}" for c in ("68% 하단", "68% 상단", "95% 하단", "95% 상단")}),
         hide_index=True, width="stretch")
+
+    st.subheader("손실 위험 (VaR · ES)")
+    hist_h = np.log(close).diff(horizon).dropna().values           # 학습 기간의 실제 h일 수익률 (겹침)
+    risk = {"1d95": var_es(sims[:, 0], 0.95), "1d99": var_es(sims[:, 0], 0.99), "h95": var_es(sims[:, -1], 0.95)}
+    past = {"1d95": var_es(rets.values, 0.95), "1d99": var_es(rets.values, 0.99),
+            "h95": var_es(hist_h, 0.95) if len(hist_h) >= 100 else (np.nan, np.nan)}
+    v1, v2, v3, v4 = st.columns(4)
+    for col, key, label in ((v1, "1d95", "하루 VaR 95%"), (v2, "1d99", "하루 VaR 99%"), (v3, "h95", f"{horizon}거래일 VaR 95%")):
+        col.metric(label, f"−{risk[key][0]:.1%}",
+                   f"과거 실제 −{past[key][0]:.1%}" if np.isfinite(past[key][0]) else "과거 표본 부족", delta_color="off")
+    v4.metric(f"{horizon}거래일 ES 95%", f"−{risk['h95'][1]:.1%}",
+              f"과거 실제 −{past['h95'][1]:.1%}" if np.isfinite(past["h95"][1]) else "과거 표본 부족", delta_color="off",
+              help="최악 5% 경우의 평균 손실")
+    st.caption(f"VaR 95%는 '100번 중 95번은 손실이 이보다 작다'는 뜻입니다. 예를 들어 1,000만 원어치를 들고 있다면 "
+               f"하루에 약 {risk['1d95'][0] * 1e7:,.0f}원 넘게 잃을 확률이 5%입니다. ES는 그 나머지 최악 5% 경우의 평균 손실입니다. "
+               f"큰 값은 t분포 GARCH(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다.")
 
 # ---------------- 방향 예측 ----------------
 with tab_dir:
@@ -310,7 +350,8 @@ with tab_dir:
 
             st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 단순 보유와 비교 "
                         f"(거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
-                        f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f})")
+                        f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f}, "
+                        f"최대 낙폭 {ev['mdd']:.0%} vs {ev['mdd_bh']:.0%})")
             eq = ev["equity"]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=eq.index, y=eq["전략"], name="50% 넘을 때만 보유", line=dict(color=ui.BLUE)))
@@ -395,13 +436,17 @@ with tab_pick:
             fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                               yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
+            st.caption(f"최대 낙폭: 상위 20% {max_drawdown(cv['auto']['상위 20% (비용 후)']):.0%} · "
+                       f"전체 종목 평균 {max_drawdown(cv['_universe']):.0%}. "
+                       "리밸런싱 시점 기준이라 그 사이에 잠깐 더 빠졌던 하락은 덜 잡힙니다.")
 
             st.markdown("**모델 비교** — 모두 같은 조건으로 시험했습니다. 이 표를 보고 나중에 1등을 고르면 성적이 부풀려지므로, "
                         "앱은 매 시점 그때까지의 성적만 보고 고른 **자동 선택**을 씁니다.")
             st.dataframe(U["table"].style.format({
                 "평균 IC": "{:+.3f}", "IC t값": "{:+.1f}", "IC>0 비율": "{:.0%}",
                 "상위20% 초과수익(연, 비용후)": "{:+.1%}", "초과수익 t값": "{:+.1f}",
-                "상위−하위 스프레드(연)": "{:+.1%}", "평균 회전율": "{:.0%}", "리밸런싱 수": "{:.0f}"}, na_rep="—"),
+                "상위−하위 스프레드(연)": "{:+.1%}", "최대 낙폭(비용후)": "{:.0%}",
+                "평균 회전율": "{:.0%}", "리밸런싱 수": "{:.0f}"}, na_rep="—"),
                 hide_index=True, width="stretch")
             share = U["chosen"].value_counts(normalize=True)
             st.caption("자동 선택 비율: " + ", ".join(
@@ -562,11 +607,69 @@ with tab2:
     fig.update_layout(height=420, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                       hovermode="x unified", legend=dict(orientation="h", y=1.08))
     ui.chart(fig)
-    a, b, c, d = st.columns(4)
+    a, b, c, d, e = st.columns(5)
     a.metric("α (충격 반응)", f"{garch.alpha:.3f}", help="큰 하루 변동이 다음 날 변동성을 얼마나 키우는지")
     b.metric("β (지속성)", f"{garch.beta:.3f}", help="높아진 변동성이 얼마나 오래 유지되는지")
     c.metric("α+β", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
     d.metric("반감기", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
+    e.metric("꼬리 두께 (ν)", f"{garch.nu:.1f}",
+             help="충격 분포(t분포)의 자유도. 작을수록 폭락·폭등이 자주 나옵니다. 정규분포는 ∞, 주식은 보통 4~10")
+
+# ---------------- 시장 국면 ----------------
+with tab_regime:
+    ui.section("Market Regime", "지금은 안정 국면일까, 불안 국면일까",
+               "주가가 조용히 움직이는 '안정 국면'과 크게 출렁이는 '불안 국면'을 2상태 국면 전환 모델(Markov switching)로 나눕니다. "
+               "확률은 그날까지의 데이터만으로 계산해서, 과거 구간에도 미래 정보가 섞이지 않습니다.")
+    try:
+        with st.spinner("국면 모델 추정 중…"):
+            R = get_regime(ticker, cost_bps)
+    except Exception as e:
+        R = None
+        st.error(f"국면 분석을 할 수 없습니다 (데이터 부족 등): {e}")
+    if R is not None:
+        p_now, stt = R["p_now"], R["states"]
+        high = p_now >= 0.5
+        ui.verdict(f"기준일 {R['asof'].date()} · 최대 10년치 일봉", rg.STATE_LABELS[int(high)], "",
+                   [(f"불안 국면 확률 {p_now:.0%}", "elective" if high else "approve")],
+                   f"안정 국면은 연 변동성 약 {stt['연 변동성'].iloc[0]:.0%}, 불안 국면은 약 {stt['연 변동성'].iloc[1]:.0%}로 추정됩니다. "
+                   f"한 번 들어가면 평균 {stt['평균 지속 기간(거래일)'].iloc[0]:.0f}거래일 / "
+                   f"{stt['평균 지속 기간(거래일)'].iloc[1]:.0f}거래일 이어졌습니다.")
+
+        ph = R["p_high"].dropna()
+        px_r = R["close"].reindex(ph.index)
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.6, 0.4])
+        fig.add_trace(go.Scatter(x=px_r.index, y=px_r.values, name="종가", line=dict(color=ui.INK, width=1.5)), row=1, col=1)
+        on = (ph >= 0.5).values                                   # 불안 국면 구간을 가격 차트에 옅게 칠함 (선을 먼저 그려야 칸이 생김)
+        edges = np.flatnonzero(np.diff(np.r_[0, on.astype(int), 0]))
+        for a0, a1 in zip(edges[::2], edges[1::2]):
+            fig.add_vrect(x0=ph.index[a0], x1=ph.index[a1 - 1], fillcolor="rgba(183,110,0,0.14)", line_width=0,
+                          layer="below", row=1, col=1)
+        fig.add_trace(go.Scatter(x=ph.index, y=ph.values, name="불안 국면 확률", fill="tozeroy",
+                                 line=dict(color=ui.AMBER, width=1), fillcolor="rgba(183,110,0,0.18)"), row=2, col=1)
+        fig.add_hline(y=0.5, line=dict(color=ui.NEUTRAL, dash="dot"), row=2, col=1)
+        fig.update_yaxes(title_text="종가", row=1, col=1)
+        fig.update_yaxes(tickformat=".0%", range=[0, 1], title_text="불안 국면 확률", row=2, col=1)
+        fig.update_layout(height=480, hovermode="x unified", legend=dict(orientation="h", y=1.08))
+        ui.chart(fig)
+        st.caption("주황 구간 = 불안 국면 확률 50% 이상. 모델은 1년마다 그때까지의 데이터로만 다시 추정했고, 처음 3년은 학습 기간이라 비어 있습니다.")
+
+        st.markdown("**국면별 특징** (전체 기간으로 추정)")
+        st.dataframe(stt.style.format({"연 평균 수익률": "{:+.1%}", "연 변동성": "{:.1%}", "평균 지속 기간(거래일)": "{:.0f}"}),
+                     width="stretch")
+
+        st.markdown(f"**불안 국면일 때 현금으로 피했다면?** 단순 보유와 비교 (거래비용 {cost_bps}bp, "
+                    f"주식을 들고 있던 기간 {R['time_in_market']:.0%}, 국면이 바뀌어 사고판 횟수 {R['switches']}번)")
+        st.dataframe(R["table"].style.format({"연 수익률": "{:+.1%}", "연 변동성": "{:.1%}", "샤프": "{:.2f}",
+                                              "최대 낙폭": "{:.0%}"}), width="stretch")
+        eq = R["equity"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=eq.index, y=eq["불안 국면엔 현금"], name="불안 국면엔 현금", line=dict(color=ui.BLUE)))
+        fig.add_trace(go.Scatter(x=eq.index, y=eq["단순 보유"], name="단순 보유", line=dict(color=ui.NEUTRAL)))
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                          yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
+        ui.chart(fig)
+        st.caption("확률이 50% 이상인 날 종가에 팔고 다음 날부터 현금(이자 0으로 계산), 50% 아래로 내려오면 다시 삽니다. "
+                   "국면 분류는 보통 수익을 늘리기보다 큰 하락을 줄이는 도구입니다. 상승장 초입을 놓치는 대가가 따릅니다.")
 
 # ---------------- 3. 신호 & 헤지 손익 ----------------
 with tab3:
@@ -622,11 +725,62 @@ with tab3:
             st.warning("변동성 매도는 예측이 맞으면 꾸준히 벌지만, 실제 변동성이 시장 기대(IV)를 넘으면 손실이 크게 날 수 있습니다. "
                        "포지션 크기를 제한하고 손절 기준을 꼭 정하세요.")
 
+    st.subheader("과거 성적 — 이 신호대로 거래했다면?")
+    vix_sym = md.VOL_INDEX.get(ticker.upper())
+    if vix_sym is None:
+        st.caption("과거 IV가 필요해서 변동성 지수가 있는 종목만 검증할 수 있습니다: SPY·VOO·IVV (VIX), QQQ (VXN), IWM (RVX).")
+    else:
+        vix_name = vix_sym.lstrip("^")
+        st.markdown(f"과거 {vix_name}(30일 만기 옵션에 담긴 시장 기대 변동성)를 그날의 IV로 보고, 한 달(21거래일)마다 "
+                    "그때까지의 데이터로만 GARCH 예측 → 신호 → ATM 스트래들 진입 → 매일 델타헤지 → 만기 정산을 반복합니다. "
+                    "사이드바의 VRP·관망 구간·거래비용을 그대로 씁니다.")
+        if st.button("과거 성적 계산", type="primary", key="vol_bt"):
+            try:
+                with st.spinner("최대 10년치를 한 달씩 다시 예측하는 중…"):
+                    res = get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q)
+            except Exception as e:
+                res = "error"
+                st.error(f"계산 실패: {e}")
+            if res is None:
+                st.warning(f"{vix_name} 데이터를 불러오지 못했습니다.")
+            elif res != "error":
+                vbt, vtab, vcurves = res
+                sg, sh, lg = vtab.loc["signal"], vtab.loc["short"], vtab.loc["long"]
+                if sg["거래 수"] == 0:
+                    tags = [("신호가 한 번도 나지 않음", "neutral")]
+                else:
+                    tags = [("이익이 우연이 아님 (t > 2)", "approve") if sg["t값"] > 2 else ("이익이 우연일 수 있음", "elective"),
+                            ("항상 매도보다 나음", "approve") if sg["샤프(연)"] > sh["샤프(연)"] else ("항상 매도보다 못함", "elective")]
+                ui.verdict(f"{vbt.index[0].date()} ~ {vbt.index[-1].date()} · 진입 {len(vbt)}번 · {vix_name} 기준",
+                           f"샤프 {sg['샤프(연)']:.2f}", "GARCH 신호대로 (연)", tags,
+                           f"비교: 항상 변동성 매도 샤프 {sh['샤프(연)']:.2f}, 항상 매수 {lg['샤프(연)']:.2f}. "
+                           f"신호는 매수 {int((vbt['signal'] == 1).sum())}번 · 매도 {int((vbt['signal'] == -1).sum())}번 · "
+                           f"관망 {int((vbt['signal'] == 0).sum())}번이었습니다.")
+                st.dataframe(vtab.set_index("전략").style.format({
+                    "거래 수": "{:.0f}", "승률": "{:.0%}", "평균 손익(주가 대비)": "{:+.2%}", "평균 손익(프리미엄 대비)": "{:+.1%}",
+                    "t값": "{:+.1f}", "샤프(연)": "{:.2f}", "최대 낙폭": "{:.0%}", "최악 1회": "{:+.1%}"}, na_rep="—"),
+                    width="stretch")
+                fig = go.Figure()
+                for name, color in zip(vcurves.columns, (ui.BLUE, ui.AMBER, ui.PURPLE)):
+                    fig.add_trace(go.Scatter(x=vcurves.index, y=vcurves[name], name=name, line=dict(color=color)))
+                fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                                  yaxis_title="누적 (시작=1, 주가 1주당 스트래들 1개)", legend=dict(orientation="h", y=1.1))
+                ui.chart(fig)
+                k1, k2, k3 = st.columns(3)
+                k1.metric("과거 평균 VRP", f"{(vbt['iv'] - vbt['realized']).mean():+.1%}",
+                          f"{vix_name} − 이후 21일 실제 변동성", delta_color="off")
+                vrmse = lambda c: np.sqrt(np.mean((vbt[c] - vbt["realized"]) ** 2))
+                k2.metric("GARCH 예측 오차", f"{vrmse('garch'):.1%}", "실제 변동성 대비 RMSE", delta_color="off")
+                k3.metric(f"{vix_name} 예측 오차", f"{vrmse('iv'):.1%}", "실제 변동성 대비 RMSE", delta_color="off")
+                st.caption(f"{vix_name}는 외가격 옵션까지 섞어 계산해서 실제 ATM 옵션 IV보다 보통 1~3%p 높습니다. 그래서 '항상 매도' 성적이 "
+                           "실제보다 좋게 나올 수 있습니다. 옵션 호가 차이(스프레드)는 넣지 않았고, 금리·배당은 현재 값으로 고정했습니다. "
+                           "평균 VRP를 보고 사이드바 VRP를 맞춘 뒤 다시 돌리면 과거를 보고 맞춘 것이라 성적이 부풀려집니다.")
+
 # ---------------- 4. 백테스트 ----------------
 with tab4:
     ui.section("Backtest", "GARCH 예측은 과거에 얼마나 맞았나",
                f"과거 여러 시점에서 그때까지의 데이터만으로 {horizon}일 변동성을 다시 예측하고, 실제로 움직인 폭과 비교합니다. "
-               "비교 대상은 '최근 변동성이 그대로 이어진다'는 단순 예측입니다.")
+               "비교 대상은 '최근 변동성이 그대로 이어진다'는 단순 예측입니다. 범위와 VaR는 t분포 GARCH 시뮬레이션으로 판정합니다.")
     if st.button("검증 실행", type="primary"):
         with st.spinner("과거 여러 시점에서 다시 예측하는 중…"):
             bt = run_backtest(rets.values, horizon)
@@ -634,12 +788,13 @@ with tab4:
             st.warning("데이터가 부족합니다. 학습 데이터 기간을 늘리거나 예측 기간을 줄이세요.")
         else:
             rmse = lambda c: np.sqrt(np.mean((bt[c] - bt["realized"]) ** 2))
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("모델 예측 오차", f"{rmse('garch'):.2%}", help="RMSE, 작을수록 정확")
             m2.metric("단순 예측 오차", f"{rmse('naive'):.2%}",
                       f"모델이 {'더 정확' if rmse('garch') < rmse('naive') else '덜 정확'}", delta_color="off")
             m3.metric("68% 범위 안에 든 비율", f"{bt['in1'].mean():.0%}", "목표 68%", delta_color="off")
             m4.metric("95% 범위 안에 든 비율", f"{bt['in2'].mean():.0%}", "목표 95%", delta_color="off")
+            m5.metric("VaR 95%를 넘은 손실", f"{bt['var_breach'].mean():.0%}", "목표 5%", delta_color="off")
             dates = rets.index[bt["origin"]]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=dates, y=bt["realized"], name="실제 변동성", line=dict(color=ui.INK)))

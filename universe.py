@@ -28,6 +28,7 @@ from sklearn.linear_model import Ridge
 
 import alt_data as ad
 import kr_data
+from quant_engine import max_drawdown
 
 UDIR = kr_data.CACHE / "universe"
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -371,6 +372,7 @@ def evaluate(wf, cost_bps=15.0, q=5):
                    "IC>0 비율": (icm > 0).mean(), "상위20% 초과수익(연, 비용후)": ex.mean() * per_year,
                    "초과수익 t값": ex.mean() / ex.std() * np.sqrt(len(ex)) if ex.std() > 0 else np.nan,
                    "상위−하위 스프레드(연)": (top - pd.Series(bot_r, index=dates)).mean() * per_year,
+                   "최대 낙폭(비용후)": max_drawdown((1 + net).cumprod()),
                    "평균 회전율": np.mean(turn[1:]) if len(turn) > 1 else np.nan, "리밸런싱 수": len(dates)}
         curves[m] = pd.DataFrame({"상위 20% (비용 후)": (1 + net).cumprod(), "하위 20%": (1 + pd.Series(bot_r, index=dates)).cumprod()})
     curves["_universe"] = (1 + uni).cumprod()

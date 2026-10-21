@@ -21,6 +21,22 @@ def load_history(ticker, years):
     return close
 
 
+# 과거 내재변동성 대용: Cboe 변동성 지수 (30일 만기 옵션으로 계산, 지수 포인트 = 연율 %)
+VOL_INDEX = {"SPY": "^VIX", "VOO": "^VIX", "IVV": "^VIX", "^GSPC": "^VIX",
+             "QQQ": "^VXN", "^NDX": "^VXN", "IWM": "^RVX", "^RUT": "^RVX"}
+
+
+def load_vol_index(ticker, years):
+    """이 종목에 맞는 변동성 지수의 과거 값(소수, 예: 0.18). 없으면 None."""
+    sym = VOL_INDEX.get(ticker.upper())
+    if sym is None:
+        return None
+    try:
+        return load_history(sym, years) / 100.0
+    except ValueError:
+        return None
+
+
 _UA = {"User-Agent": "Mozilla/5.0"}
 _MARKETS = {"KOSPI": ("KS", "코스피"), "KOSDAQ": ("KQ", "코스닥")}
 
