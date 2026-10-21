@@ -267,6 +267,20 @@ vb2 = vol_signal_backtest(_px2, _iv, vrp=0.0, threshold=0.02, h=21, cost_bps=1.0
 done = [d for i, d in enumerate(vb.index) if _idx.get_loc(d) + 21 < 1000]      # 결과까지 T 이전에 끝난 거래
 assert len(done) > 10 and np.allclose(vb.loc[done].values, vb2.loc[done].values)
 
+# 현실성 옵션: 옵션 체결 비용 = 비율 × 스트래들 가격, IV를 낮추면 매도 이익이 줄어듦, GARCH 예측 재사용, 진입일 늦추기
+from quant_engine import vol_backtest_robustness
+_c1 = vol_signal_backtest(_px, _iv, cost_bps=1.0, option_spread=0.01)
+assert np.allclose(_c1["cost"] - vb["cost"], 0.01 * vb["premium"]) and np.allclose(_c1["long"], vb["long"])
+_lo = vol_signal_backtest(_px, _iv, cost_bps=1.0, iv_gap=0.02, forecasts=vb["garch"].to_dict())
+assert np.allclose(_lo["garch"], vb["garch"]) and np.allclose(_lo["iv"], 0.28) and np.allclose(_lo["iv_index"], 0.30)
+assert (-_lo["long"]).mean() < (-vb["long"]).mean() and (_lo["premium"] < vb["premium"]).all()
+_late = vol_signal_backtest(_px, _iv, cost_bps=1.0, offset=5)
+assert _late.index[0] == _idx[505] and vb.index[0] == _idx[500]
+gtab, otab = vol_backtest_robustness(_px, _iv, vb, cost_bps=1.0, gaps=(0.0, 0.02), offsets=(0, 5))
+assert list(gtab.index) == ["0%p", "2%p"] and gtab.loc["0%p", "진입 수"] == len(vb)
+assert gtab.loc["2%p", "항상 매도 평균 손익(주가 대비)"] < gtab.loc["0%p", "항상 매도 평균 손익(주가 대비)"]
+assert otab.loc["5거래일 늦게", "첫 진입일"] == _idx[505].date()
+
 # IV 결합 예측: 과거 결과만 쓰는지 + 실제가 GARCH·IV의 섞임이면 결합이 둘 다보다 정확해야
 from quant_engine import add_combined_forecast, forecast_errors, short_only_split
 _rng = np.random.default_rng(31)

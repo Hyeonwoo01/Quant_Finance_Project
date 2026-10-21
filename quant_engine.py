@@ -273,31 +273,43 @@ VOL_STRATEGIES = {"signal": "GARCH 신호대로", "short": "항상 변동성 매
 
 
 def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
-                        fit_window=750, min_history=500, dist="t"):
+                        fit_window=750, min_history=500, dist="t", iv_gap=0.0, option_spread=0.0,
+                        offset=0, forecasts=None):
     """과거 IV(예: VIX)로 '변동성 신호대로 ATM 스트래들을 사고팔며 매일 델타헤지'한 성적 (워크포워드).
 
     각 진입일 t: t까지의 수익률로만 GARCH 적합 → h일 평균 변동성 예측, 그날 종가의 IV와 비교해 신호.
     t 종가에 IV 가격으로 스트래들 진입 → h거래일 동안 매일 종가에 델타헤지 → h일 뒤 만기 정산.
     진입은 h일 간격(겹치지 않음)이라 표본이 서로 독립에 가깝다.
-    반환: 진입일별 표 — long은 롱 스트래들 헤지 손익(비용 전), cost는 헤지 거래비용, premium은 스트래들 가격 (모두 주가 대비).
+
+    iv_gap: 변동성 지수와 실제 ATM IV의 차이(소수). VIX는 외가격 옵션까지 섞여 ATM IV보다 보통 0.01~0.03 높다
+            → 신호·가격에 쓰는 IV = 지수 − iv_gap.
+    option_spread: 옵션 체결 비용 (스트래들 가격 대비, 진입할 때 한 번 — 만기까지 들고 가 자동 정산되므로 청산 거래 없음).
+    offset: 첫 진입을 며칠 늦출지 (진입일에 따라 결과가 얼마나 흔들리는지 볼 때).
+    forecasts: {진입일: GARCH 예측} — 같은 진입일로 설정만 바꿔 다시 돌릴 때 GARCH 재적합을 건너뛴다.
+    반환: 진입일별 표 — long은 롱 스트래들 헤지 손익(비용 전), cost는 헤지·옵션 체결 비용, premium은 스트래들 가격
+          (모두 주가 대비), iv는 보정한 IV, iv_index는 원래 지수 값.
     """
     df = pd.concat({"px": close, "iv": iv}, axis=1, join="inner").dropna()
     px, ivs, dates = df["px"].values, df["iv"].values, df.index
     lr = np.diff(np.log(px))                     # lr[k] = k → k+1일 로그수익률
     logic = VolatilityTradingLogic(vrp, threshold)
     rows = []
-    for i in range(min_history, len(px) - h, h):
-        g = GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i])
-        f = g.forecast_vol(h)
+    for i in range(min_history + offset, len(px) - h, h):
+        if forecasts is not None and dates[i] in forecasts:
+            f = forecasts[dates[i]]
+        else:
+            f = GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i]).forecast_vol(h)
+        sigma = max(ivs[i] - iv_gap, 0.01)
         T = max((dates[i + h] - dates[i]).days, 1) / 365
-        eng = GammaScalpingEngine(px[i], px[i], T, r, ivs[i], q)
+        eng = GammaScalpingEngine(px[i], px[i], T, r, sigma, q)
         path = px[i:i + h + 1]
         gross = eng.hedged_pnl(path, 1, 0.0)
-        cost = gross - eng.hedged_pnl(path, 1, cost_bps)      # 비용은 매수·매도 방향과 무관하게 같다
-        rows.append({"date": dates[i], "garch": f, "iv": ivs[i],
+        premium = eng.straddle_greeks()["price"]
+        cost = gross - eng.hedged_pnl(path, 1, cost_bps) + option_spread * premium   # 방향과 무관하게 같은 비용
+        rows.append({"date": dates[i], "garch": f, "iv": sigma, "iv_index": ivs[i],
                      "realized": float(np.sqrt(np.mean(lr[i:i + h] ** 2) * 252)),
-                     "signal": logic.generate_signal(f, ivs[i]), "long": gross / px[i], "cost": cost / px[i],
-                     "premium": eng.straddle_greeks()["price"] / px[i]})
+                     "signal": logic.generate_signal(f, sigma), "long": gross / px[i], "cost": cost / px[i],
+                     "premium": premium / px[i]})
     return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
 
 
@@ -322,6 +334,33 @@ def summarize_vol_backtest(bt, h=21):
         stats, curves[name] = _strategy_stats(pos, bt, h)
         rows[key] = {"전략": name, **stats}
     return pd.DataFrame(rows).T, pd.DataFrame(curves)
+
+
+def vol_backtest_robustness(close, iv, base, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
+                            iv_gap=0.0, option_spread=0.0, gaps=(0.0, 0.01, 0.02, 0.03), offsets=(0, 4, 8, 12, 16)):
+    """현실성 점검 두 가지 (base = 같은 설정으로 돌린 vol_signal_backtest 결과, GARCH 예측 재사용).
+
+    gap 표: IV = 지수 − gap 으로 바꿔 가며 계산 → 'VIX와 실제 ATM IV 차이'를 얼마로 보느냐에 따라 결과가 어떻게 바뀌는지.
+    offset 표: 첫 진입일을 0~16거래일 늦춰 가며 같은 계산 → 진입일 운에 따라 결과가 얼마나 흔들리는지.
+    """
+    kw = dict(vrp=vrp, threshold=threshold, h=h, cost_bps=cost_bps, r=r, q=q)
+    cache = base["garch"].to_dict()
+
+    def row(bt):
+        tab = summarize_vol_backtest(bt, h)[0]
+        sh, sg = tab.loc["short"], tab.loc["signal"]
+        return {"진입 수": len(bt), "첫 진입일": bt.index[0].date(),
+                "항상 매도 평균 손익(주가 대비)": sh["평균 손익(주가 대비)"], "항상 매도 t값": sh["t값"],
+                "항상 매도 샤프": sh["샤프(연)"], "항상 매도 최대 낙폭": sh["최대 낙폭"],
+                "신호대로 샤프": sg["샤프(연)"], "신호대로 t값": sg["t값"]}
+
+    by_gap = {f"{g * 100:.0f}%p": row(vol_signal_backtest(close, iv, iv_gap=g, option_spread=option_spread,
+                                                          forecasts=cache, **kw)) for g in gaps}
+    by_off = {}
+    for o in offsets:
+        bt = base if o == 0 else vol_signal_backtest(close, iv, iv_gap=iv_gap, option_spread=option_spread, offset=o, **kw)
+        by_off[f"{o}거래일 늦게"] = row(bt)
+    return pd.DataFrame(by_gap).T, pd.DataFrame(by_off).T
 
 
 def add_combined_forecast(bt, min_train=24):
