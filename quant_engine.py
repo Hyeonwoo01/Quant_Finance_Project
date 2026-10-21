@@ -1,11 +1,13 @@
 """노트북(Quant_Finance_Project_fixed.ipynb)의 핵심 클래스를 프로그램용 모듈로 옮긴 것.
 
-프라이싱/IV → GARCH 변동성 예측 → 신호 → 델타헤지(감마 스캘핑) 손익.
+프라이싱/IV → GARCH 변동성 예측 → 신호 → 델타헤지(감마 스캘핑) 손익 → 과거 IV로 신호 검증, 위험 지표(VaR·ES·MDD).
 """
 import numpy as np
-from scipy.stats import norm
+import pandas as pd
 from scipy.optimize import brentq, minimize
 from scipy.signal import lfilter
+from scipy.special import gammaln
+from scipy.stats import norm
 
 
 class RiskNeutralPricingEngine:
@@ -91,14 +93,19 @@ class RiskNeutralPricingEngine:
 
 
 class GarchVolForecaster:
-    """GARCH(1,1) 가우시안 준최우추정 + 옵션 잔존만기 구간의 '평균' 변동성 예측.
+    """GARCH(1,1) 최우추정 + 옵션 잔존만기 구간의 '평균' 변동성 예측.
 
+    dist="t"(기본): 충격이 스튜던트 t분포 — 폭락·폭등(두꺼운 꼬리)을 반영, 자유도 nu도 추정.
+    dist="normal": 가우시안 (nu = ∞).
     입력: 일간 로그수익률(소수 단위). 출력: 연율화된 소수 변동성 → IV와 바로 비교 가능.
     """
 
-    def __init__(self, trading_days=252):
-        self.trading_days = trading_days
+    def __init__(self, trading_days=252, dist="t"):
+        if dist not in ("t", "normal"):
+            raise ValueError("dist는 't' 또는 'normal'이어야 합니다.")
+        self.trading_days, self.dist = trading_days, dist
         self.omega = self.alpha = self.beta = self.sigma2_next = None
+        self.nu = np.inf
         self.cond_vol = None     # 적합 구간의 조건부 변동성(연율) — 차트용
 
     def fit(self, daily_log_returns):
@@ -114,14 +121,22 @@ class GarchVolForecaster:
             return s2
 
         def nll(p):
-            s2 = cond_var(p)
-            return 0.5 * np.sum(np.log(s2) + x**2 / s2)
+            s2 = cond_var(p[:3])
+            if self.dist == "normal":
+                return 0.5 * np.sum(np.log(s2) + x**2 / s2)
+            nu = p[3]       # 분산이 s2가 되도록 표준화한 t분포
+            const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * (nu - 2))
+            return np.sum(0.5 * np.log(s2) + (nu + 1) / 2 * np.log1p(x**2 / ((nu - 2) * s2))) - n * const
 
-        res = minimize(nll, x0=[0.05 * var0, 0.05, 0.90], method='SLSQP',
-                       bounds=[(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)],
+        x0 = [0.05 * var0, 0.05, 0.90]
+        bounds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)]
+        if self.dist == "t":
+            x0, bounds = x0 + [8.0], bounds + [(2.1, 200.0)]
+        res = minimize(nll, x0=x0, method='SLSQP', bounds=bounds,
                        constraints=[{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2]}])
-        omega, alpha, beta = res.x
-        s2 = cond_var(res.x)
+        omega, alpha, beta = res.x[:3]
+        self.nu = float(res.x[3]) if self.dist == "t" else np.inf
+        s2 = cond_var(res.x[:3])
         self.omega, self.alpha, self.beta = omega / 1e4, alpha, beta
         self.sigma2_next = (omega + alpha * x[-1] ** 2 + beta * s2[-1]) / 1e4
         self.cond_vol = np.sqrt(s2 / 1e4 * self.trading_days)
@@ -143,6 +158,26 @@ class GarchVolForecaster:
     def forecast_vol(self, horizon_days):
         """향후 horizon_days 동안의 평균 변동성(연율, 소수)."""
         return float(np.sqrt(self.daily_var_path(horizon_days).mean() * self.trading_days))
+
+    def simulate(self, horizon_days, n_paths=10000, seed=0):
+        """적합한 GARCH(+t 충격)로 앞으로 1..horizon_days일의 누적 로그수익률을 시뮬레이션 → (n_paths, horizon_days).
+
+        평균은 0으로 둔다 (중앙값 ≈ 현재가). 변동성이 날마다 바뀌고 충격이 두꺼운 꼬리를 가지므로,
+        정규분포 공식(±z·σ√h)보다 폭락·폭등 쪽 분위수가 현실에 가깝다.
+        """
+        rng = np.random.default_rng(seed)
+        s2 = np.full(n_paths, self.sigma2_next)
+        cum, out = np.zeros(n_paths), np.empty((n_paths, horizon_days))
+        for k in range(horizon_days):
+            if np.isfinite(self.nu):
+                z = rng.standard_t(self.nu, n_paths) * np.sqrt((self.nu - 2) / self.nu)
+            else:
+                z = rng.standard_normal(n_paths)
+            r = np.sqrt(s2) * z
+            cum += r
+            out[:, k] = cum
+            s2 = self.omega + self.alpha * r**2 + self.beta * s2
+        return out
 
 
 class VolatilityTradingLogic:
@@ -216,6 +251,74 @@ class GammaScalpingEngine:
         payoff = np.abs(S[:, n] - K)
         out = cash + shares * S[:, n] + position * payoff
         return float(out[0]) if single else out
+
+
+def var_es(log_returns, level=0.95):
+    """VaR·ES (양수 = 손실률). log_returns: 시뮬레이션 또는 과거의 기간 로그수익률들.
+
+    VaR: 이 확률(level)로 손실이 이보다 작다. ES: 그 밖의 최악 (1−level) 경우의 평균 손실.
+    """
+    simple = np.expm1(np.asarray(log_returns, float))
+    q = np.quantile(simple, 1 - level)
+    return float(-q), float(-simple[simple <= q].mean())
+
+
+def max_drawdown(equity):
+    """자산 곡선(시작=1, 곱셈 누적)의 최대 낙폭. 음수(예: -0.35 = 고점 대비 35% 하락)."""
+    e = np.asarray(equity, float)
+    return float(np.min(e / np.maximum.accumulate(e) - 1)) if len(e) else 0.0
+
+
+VOL_STRATEGIES = {"signal": "GARCH 신호대로", "short": "항상 변동성 매도", "long": "항상 변동성 매수"}
+
+
+def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
+                        fit_window=750, min_history=500, dist="t"):
+    """과거 IV(예: VIX)로 '변동성 신호대로 ATM 스트래들을 사고팔며 매일 델타헤지'한 성적 (워크포워드).
+
+    각 진입일 t: t까지의 수익률로만 GARCH 적합 → h일 평균 변동성 예측, 그날 종가의 IV와 비교해 신호.
+    t 종가에 IV 가격으로 스트래들 진입 → h거래일 동안 매일 종가에 델타헤지 → h일 뒤 만기 정산.
+    진입은 h일 간격(겹치지 않음)이라 표본이 서로 독립에 가깝다.
+    반환: 진입일별 표 — long은 롱 스트래들 헤지 손익(비용 전), cost는 헤지 거래비용, premium은 스트래들 가격 (모두 주가 대비).
+    """
+    df = pd.concat({"px": close, "iv": iv}, axis=1, join="inner").dropna()
+    px, ivs, dates = df["px"].values, df["iv"].values, df.index
+    lr = np.diff(np.log(px))                     # lr[k] = k → k+1일 로그수익률
+    logic = VolatilityTradingLogic(vrp, threshold)
+    rows = []
+    for i in range(min_history, len(px) - h, h):
+        g = GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i])
+        f = g.forecast_vol(h)
+        T = max((dates[i + h] - dates[i]).days, 1) / 365
+        eng = GammaScalpingEngine(px[i], px[i], T, r, ivs[i], q)
+        path = px[i:i + h + 1]
+        gross = eng.hedged_pnl(path, 1, 0.0)
+        cost = gross - eng.hedged_pnl(path, 1, cost_bps)      # 비용은 매수·매도 방향과 무관하게 같다
+        rows.append({"date": dates[i], "garch": f, "iv": ivs[i],
+                     "realized": float(np.sqrt(np.mean(lr[i:i + h] ** 2) * 252)),
+                     "signal": logic.generate_signal(f, ivs[i]), "long": gross / px[i], "cost": cost / px[i],
+                     "premium": eng.straddle_greeks()["price"] / px[i]})
+    return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
+
+
+def summarize_vol_backtest(bt, h=21):
+    """세 전략(신호대로 / 항상 매도 / 항상 매수)의 거래별 손익 요약 + 자산 곡선."""
+    per_year = 252 / h
+    rows, curves = {}, {}
+    for key, name in VOL_STRATEGIES.items():
+        pos = bt["signal"] if key == "signal" else pd.Series(-1 if key == "short" else 1, index=bt.index)
+        ret = pos * bt["long"] - pos.abs() * bt["cost"]          # 주가 1주당 스트래들 1개 기준 수익률
+        traded = pos != 0
+        rt = ret[traded]
+        n = int(traded.sum())
+        rows[key] = {"전략": name, "거래 수": n, "승률": (rt > 0).mean() if n else np.nan,
+                     "평균 손익(주가 대비)": rt.mean() if n else np.nan,
+                     "평균 손익(프리미엄 대비)": (rt / bt["premium"][traded]).mean() if n else np.nan,
+                     "t값": rt.mean() / rt.std() * np.sqrt(n) if n > 2 and rt.std() > 0 else np.nan,
+                     "샤프(연)": ret.mean() / ret.std() * np.sqrt(per_year) if ret.std() > 0 else np.nan,
+                     "최대 낙폭": max_drawdown((1 + ret).cumprod()), "최악 1회": rt.min() if n else np.nan}
+        curves[name] = (1 + ret).cumprod()
+    return pd.DataFrame(rows).T, pd.DataFrame(curves)
 
 
 def simulate_gbm_paths(S0, vol, r, T, n_steps, n_paths, rng):

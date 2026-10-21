@@ -217,4 +217,77 @@ assert abs(v["bm"].loc["2024-03-18", "000010"] - 1.20) < 1e-12
 assert abs(v["ep"].loc["2024-05-16", "000010"] - 0.45) < 1e-12         # 10+10+20+5 = 45
 assert abs(v["roe"].loc["2024-05-16", "000010"] - 45 / 125) < 1e-12
 assert v["bm"].loc["2023-05-15", "000010"] != v["bm"].loc["2023-05-15", "000010"]   # 첫 공시 전엔 NaN
+
+# ---------------- t분포 GARCH · 위험 지표 ----------------
+from quant_engine import GammaScalpingEngine as _GSE, max_drawdown, summarize_vol_backtest, var_es, vol_signal_backtest
+import regime as rg
+
+
+def simulate_garch_t(n, omega, alpha, beta, nu, rng):
+    r, s2 = np.empty(n), omega / (1 - alpha - beta)
+    for i in range(n):
+        r[i] = np.sqrt(s2) * rng.standard_t(nu) * np.sqrt((nu - 2) / nu)
+        s2 = omega + alpha * r[i] ** 2 + beta * s2
+    return r
+
+
+gt = GarchVolForecaster().fit(simulate_garch_t(6000, 4e-6, 0.08, 0.90, 5.0, np.random.default_rng(11)))
+assert 3.5 < gt.nu < 7.5 and abs(gt.persistence - 0.98) < 0.03, (gt.nu, gt.persistence)
+assert GarchVolForecaster(dist="normal").fit(simulate_garch(3000, 4e-6, 0.08, 0.90, np.random.default_rng(3))).nu == np.inf
+sim = gt.simulate(21, 20000, seed=1)
+assert sim.shape == (20000, 21)
+assert abs(sim[:, -1].std() - np.sqrt(gt.daily_var_path(21).sum())) / sim[:, -1].std() < 0.05   # 분산 경로와 일치
+gn_ = GarchVolForecaster(dist="normal").fit(simulate_garch(3000, 4e-6, 0.08, 0.90, np.random.default_rng(3)))
+z1 = gn_.simulate(1, 200000, seed=2)[:, 0]
+assert abs(np.quantile(z1, 0.01) / np.sqrt(gn_.sigma2_next) + 2.326) < 0.03                  # 정규면 1% 분위수 = −2.326σ
+assert np.quantile(gt.simulate(1, 200000, seed=2)[:, 0], 0.001) / np.sqrt(gt.sigma2_next) < -3.3   # t는 꼬리가 더 두껍다
+
+v95, es95 = var_es(np.random.default_rng(0).normal(0, 0.01, 400000), 0.95)
+assert abs(v95 - (1 - np.exp(-1.645 * 0.01))) < 3e-4 and es95 > v95
+assert max_drawdown([1.0, 1.2, 0.9, 1.3, 1.17]) == -0.25 and max_drawdown([1, 2, 3]) == 0.0
+
+# 헤지 손익: 매도 = −(매수 손익) − 거래비용 (비용은 방향과 무관)
+_e = _GSE(100, 100, 21 / 252, 0.02, 0.2, 0.01)
+_p = simulate_gbm_paths(100, 0.25, 0.02, 21 / 252, 21, 1, np.random.default_rng(5))[0]
+_g, _n = _e.hedged_pnl(_p, 1, 0.0), _e.hedged_pnl(_p, 1, 5.0)
+assert abs(_e.hedged_pnl(_p, -1, 5.0) - (-_g - (_g - _n))) < 1e-10
+
+# 변동성 신호 백테스트: IV가 실제보다 늘 10%p 비싸면 '매도' 신호가 나고 이익이어야 한다 + 미래 정보 누출 없음
+_rng = np.random.default_rng(21)
+_idx = pd.bdate_range("2015-01-01", periods=1400)
+_px = pd.Series(100 * np.exp(np.cumsum(0.2 / np.sqrt(252) * _rng.standard_normal(1400))), index=_idx)
+_iv = pd.Series(0.30, index=_idx)
+vb = vol_signal_backtest(_px, _iv, vrp=0.0, threshold=0.02, h=21, cost_bps=1.0)
+vtab, vcur = summarize_vol_backtest(vb)
+assert (vb["signal"] == -1).mean() > 0.9 and vtab.loc["signal", "평균 손익(주가 대비)"] > 0
+assert vtab.loc["long", "평균 손익(주가 대비)"] < 0 and len(vcur) == len(vb)
+_px2 = _px.copy()
+_px2.iloc[1000:] *= np.exp(np.cumsum(0.05 * _rng.standard_normal(400)))      # T=1000 이후 가격만 바꿈
+vb2 = vol_signal_backtest(_px2, _iv, vrp=0.0, threshold=0.02, h=21, cost_bps=1.0)
+done = [d for i, d in enumerate(vb.index) if _idx.get_loc(d) + 21 < 1000]      # 결과까지 T 이전에 끝난 거래
+assert len(done) > 10 and np.allclose(vb.loc[done].values, vb2.loc[done].values)
+
+# ---------------- 시장 국면 ----------------
+_rng = np.random.default_rng(7)
+_n = 3000
+_s = np.zeros(_n, int)
+for t in range(1, _n):
+    _s[t] = _rng.random() < (0.01 if _s[t - 1] == 0 else 0.97)
+_x = np.array([0.0006, -0.001])[_s] + np.array([0.006, 0.02])[_s] * _rng.standard_normal(_n)
+m = rg.RegimeSwitchingModel().fit(_x)
+assert abs(m.sd[0] - 0.006) < 0.001 and abs(m.sd[1] - 0.02) < 0.003 and abs(m.P[0, 0] - 0.99) < 0.01, (m.sd, m.P)
+assert ((m.filter(_x) >= 0.5) == _s).mean() > 0.9
+# 필터 확률은 그날까지의 데이터만 쓴다: 뒤쪽 수익률을 바꿔도 앞쪽 확률은 그대로
+_x2 = _x.copy()
+_x2[2000:] = _rng.standard_normal(1000) * 0.05
+assert np.allclose(m.filter(_x)[:2000], m.filter(_x2)[:2000])
+# 워크포워드: T 이후 가격을 바꿔도 T까지의 확률은 그대로
+_c = pd.Series(100 * np.exp(np.cumsum(_x)), index=pd.bdate_range("2012-01-02", periods=_n))
+_c2 = _c.copy()
+_c2.iloc[2100:] = _c.iloc[2100] * np.exp(np.cumsum(_x2[2100:]))
+pa, _ = rg.walk_forward(_c)
+pb, _ = rg.walk_forward(_c2)
+assert pa.iloc[:756].isna().all() and np.allclose(pa.iloc[756:2099], pb.iloc[756:2099])
+out = rg.analyze(_c, 1.0)
+assert out["table"].loc["불안 국면엔 현금", "최대 낙폭"] > out["table"].loc["단순 보유", "최대 낙폭"]   # 심어 둔 국면이면 낙폭이 줄어야
 print("모든 테스트 통과")
