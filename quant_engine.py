@@ -253,6 +253,37 @@ class GammaScalpingEngine:
         return float(out[0]) if single else out
 
 
+def straddle_price(S, K, T, r, sigma, q=0.0):
+    """ATM 스트래들(콜+풋) 블랙-숄즈 가격. 배열을 넣으면 원소별로 계산."""
+    S, K, T, sigma = (np.asarray(a, float) for a in (S, K, T, sigma))
+    vt = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / vt
+    d2 = d1 - vt
+    fs, dk = S * np.exp(-q * T), K * np.exp(-r * T)
+    return fs * (norm.cdf(d1) - norm.cdf(-d1)) - dk * (norm.cdf(d2) - norm.cdf(-d2))
+
+
+def hedged_straddle_pnl(paths, T, r, sigma, q=0.0, cost_bps=0.0):
+    """롱 ATM 스트래들을 매일 델타헤지했을 때의 만기 손익 — 행마다 만기(T)·IV(sigma)가 다른 여러 진입을 한 번에.
+
+    GammaScalpingEngine.hedged_pnl(position=+1)과 같은 계산이다 (행사가 = 각 경로의 첫 가격).
+    paths: (진입 수, n+1), T·sigma: (진입 수,).
+    """
+    S = np.asarray(paths, float)
+    T, sg = np.asarray(T, float), np.asarray(sigma, float)
+    n, K, dt, cost = S.shape[1] - 1, S[:, 0], T / (S.shape[1] - 1), cost_bps * 1e-4
+    shares = -_straddle_delta(S[:, 0], K, T, r, sg, q)
+    cash = -straddle_price(S[:, 0], K, T, r, sg, q) - shares * S[:, 0] - cost * np.abs(shares) * S[:, 0]
+    for t in range(1, n + 1):
+        cash = cash * np.exp(r * dt) + shares * S[:, t - 1] * q * dt
+        if t < n:
+            new = -_straddle_delta(S[:, t], K, T - t * dt, r, sg, q)
+            trade = new - shares
+            cash -= trade * S[:, t] + cost * np.abs(trade) * S[:, t]
+            shares = new
+    return cash + shares * S[:, n] + np.abs(S[:, n] - K)
+
+
 def var_es(log_returns, level=0.95):
     """VaR·ES (양수 = 손실률). log_returns: 시뮬레이션 또는 과거의 기간 로그수익률들.
 
@@ -292,25 +323,25 @@ def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, 
     df = pd.concat({"px": close, "iv": iv}, axis=1, join="inner").dropna()
     px, ivs, dates = df["px"].values, df["iv"].values, df.index
     lr = np.diff(np.log(px))                     # lr[k] = k → k+1일 로그수익률
+    ii = np.arange(min_history + offset, len(px) - h, h)
+    if len(ii) == 0:
+        return pd.DataFrame()
+    f = np.array([forecasts[dates[i]] if forecasts is not None and dates[i] in forecasts
+                  else GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i]).forecast_vol(h) for i in ii])
+    sigma = np.maximum(ivs[ii] - iv_gap, 0.01)
+    T = np.maximum(np.asarray((dates[ii + h] - dates[ii]).days, float), 1.0) / 365
+    paths = px[ii[:, None] + np.arange(h + 1)]                  # 진입별 h+1일 가격 경로 — 모든 진입을 한 번에 계산
+    s0 = paths[:, 0]
+    gross = hedged_straddle_pnl(paths, T, r, sigma, q, 0.0)
+    premium = straddle_price(s0, s0, T, r, sigma, q)
+    cost = gross - hedged_straddle_pnl(paths, T, r, sigma, q, cost_bps) + option_spread * premium   # 방향과 무관한 비용
     logic = VolatilityTradingLogic(vrp, threshold)
-    rows = []
-    for i in range(min_history + offset, len(px) - h, h):
-        if forecasts is not None and dates[i] in forecasts:
-            f = forecasts[dates[i]]
-        else:
-            f = GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i]).forecast_vol(h)
-        sigma = max(ivs[i] - iv_gap, 0.01)
-        T = max((dates[i + h] - dates[i]).days, 1) / 365
-        eng = GammaScalpingEngine(px[i], px[i], T, r, sigma, q)
-        path = px[i:i + h + 1]
-        gross = eng.hedged_pnl(path, 1, 0.0)
-        premium = eng.straddle_greeks()["price"]
-        cost = gross - eng.hedged_pnl(path, 1, cost_bps) + option_spread * premium   # 방향과 무관하게 같은 비용
-        rows.append({"date": dates[i], "garch": f, "iv": sigma, "iv_index": ivs[i],
-                     "realized": float(np.sqrt(np.mean(lr[i:i + h] ** 2) * 252)),
-                     "signal": logic.generate_signal(f, sigma), "long": gross / px[i], "cost": cost / px[i],
-                     "premium": premium / px[i]})
-    return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
+    out = pd.DataFrame({"garch": f, "iv": sigma, "iv_index": ivs[ii],
+                        "realized": np.sqrt(np.mean(lr[ii[:, None] + np.arange(h)] ** 2, axis=1) * 252),
+                        "signal": [logic.generate_signal(a, b) for a, b in zip(f, sigma)],
+                        "long": gross / s0, "cost": cost / s0, "premium": premium / s0}, index=dates[ii])
+    out.index.name = "date"
+    return out
 
 
 def _strategy_stats(pos, bt, h=21):
@@ -338,13 +369,22 @@ def summarize_vol_backtest(bt, h=21):
 
 def vol_backtest_robustness(close, iv, base, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
                             iv_gap=0.0, option_spread=0.0, gaps=(0.0, 0.01, 0.02, 0.03), offsets=(0, 4, 8, 12, 16)):
-    """현실성 점검 두 가지 (base = 같은 설정으로 돌린 vol_signal_backtest 결과, GARCH 예측 재사용).
+    """현실성 점검 (base = iv_gap·진입일 0으로 이미 돌린 vol_signal_backtest 결과).
 
-    gap 표: IV = 지수 − gap 으로 바꿔 가며 계산 → 'VIX와 실제 ATM IV 차이'를 얼마로 보느냐에 따라 결과가 어떻게 바뀌는지.
-    offset 표: 첫 진입일을 0~16거래일 늦춰 가며 같은 계산 → 진입일 운에 따라 결과가 얼마나 흔들리는지.
+    (차이 × 진입일) 모든 조합을 돌린다. GARCH 예측은 진입일마다 한 번만 적합하고 차이별로 재사용한다.
+    by_gap: IV = 지수 − gap 으로 바꿔 가며 → 'VIX와 실제 ATM IV 차이'를 얼마로 보느냐에 따라 결과가 어떻게 바뀌는지.
+    by_offset: 첫 진입일을 0~16거래일 늦춰 가며 → 진입일 운에 따라 결과가 얼마나 흔들리는지.
+    grid: {(차이, 진입일 늦춤): 백테스트 표} — short_only_robustness에 넘긴다.
     """
-    kw = dict(vrp=vrp, threshold=threshold, h=h, cost_bps=cost_bps, r=r, q=q)
-    cache = base["garch"].to_dict()
+    kw = dict(vrp=vrp, threshold=threshold, h=h, cost_bps=cost_bps, r=r, q=q, option_spread=option_spread)
+    grid = {(iv_gap, 0): base}
+    for o in offsets:
+        if (iv_gap, o) not in grid:
+            grid[(iv_gap, o)] = vol_signal_backtest(close, iv, iv_gap=iv_gap, offset=o, **kw)
+        cache = grid[(iv_gap, o)]["garch"].to_dict()
+        for g in gaps:
+            if (g, o) not in grid:
+                grid[(g, o)] = vol_signal_backtest(close, iv, iv_gap=g, offset=o, forecasts=cache, **kw)
 
     def row(bt):
         tab = summarize_vol_backtest(bt, h)[0]
@@ -354,13 +394,10 @@ def vol_backtest_robustness(close, iv, base, vrp=0.0, threshold=0.02, h=21, cost
                 "항상 매도 샤프": sh["샤프(연)"], "항상 매도 최대 낙폭": sh["최대 낙폭"],
                 "신호대로 샤프": sg["샤프(연)"], "신호대로 t값": sg["t값"]}
 
-    by_gap = {f"{g * 100:.0f}%p": row(vol_signal_backtest(close, iv, iv_gap=g, option_spread=option_spread,
-                                                          forecasts=cache, **kw)) for g in gaps}
-    by_off = {}
-    for o in offsets:
-        bt = base if o == 0 else vol_signal_backtest(close, iv, iv_gap=iv_gap, option_spread=option_spread, offset=o, **kw)
-        by_off[f"{o}거래일 늦게"] = row(bt)
-    return pd.DataFrame(by_gap).T, pd.DataFrame(by_off).T
+    by_gap = pd.DataFrame({f"{g * 100:g}%p": row(grid[(g, 0)]) for g in gaps}).T
+    by_off = pd.DataFrame({f"{o}거래일 늦게": row(grid[(iv_gap, o)]) for o in offsets}).T
+    grid = {k: v for k, v in grid.items() if k[0] in gaps}
+    return {"by_gap": by_gap, "by_offset": by_off, "grid": grid}
 
 
 def add_combined_forecast(bt, min_train=24):
@@ -403,6 +440,25 @@ def forecast_errors(bt, iv_name="IV"):
 SHORT_CUTOFFS = (-0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05)
 
 
+def short_rules(cutoffs=SHORT_CUTOFFS, iv_name="IV"):
+    """'매도만' 후보 규칙들 {이름: 진입별 포지션을 돌려주는 함수}. −1 = 그달 매도, 0 = 쉼."""
+    rules = {"항상 매도": lambda x: pd.Series(-1.0, index=x.index)}
+    for f, fname in (("garch", "GARCH"), ("combo", f"GARCH+{iv_name} 결합")):
+        for c in cutoffs:
+            rules[f"매도만 · {fname} 예측 · 기준 {c * 100:+.0f}%p"] = (
+                lambda x, f=f, c=c: -((x["iv"] - x[f]) > c).astype(float))
+    return rules
+
+
+def _split_half(bt, min_rows=24):
+    """결합 예측이 있는 진입들을 앞 절반(규칙 고르기) / 뒤 절반(검증)으로. 너무 적으면 None."""
+    d = bt.dropna(subset=["combo"])
+    if len(d) < min_rows:
+        return None
+    half = len(d) // 2
+    return d.iloc[:half], d.iloc[half:]
+
+
 def short_only_split(bt, h=21, cutoffs=SHORT_CUTOFFS, iv_name="IV", min_rows=24):
     """'매도만' 규칙을 앞 절반에서 고르고(앞 기간 샤프가 가장 높은 것) 뒤 절반에서 검증한다.
 
@@ -410,16 +466,11 @@ def short_only_split(bt, h=21, cutoffs=SHORT_CUTOFFS, iv_name="IV", min_rows=24)
     뒤 절반은 규칙을 고를 때 전혀 쓰지 않으므로 '처음 보는 데이터'에서의 성적이다.
     bt에는 add_combined_forecast의 combo 열이 있어야 한다. 표본이 min_rows보다 적으면 None.
     """
-    d = bt.dropna(subset=["combo"])
-    if len(d) < min_rows:
+    split = _split_half(bt, min_rows)
+    if split is None:
         return None
-    half = len(d) // 2
-    train, test = d.iloc[:half], d.iloc[half:]
-    rules = {"항상 매도": lambda x: pd.Series(-1.0, index=x.index)}
-    for f, fname in (("garch", "GARCH"), ("combo", f"GARCH+{iv_name} 결합")):
-        for c in cutoffs:
-            rules[f"매도만 · {fname} 예측 · 기준 {c * 100:+.0f}%p"] = (
-                lambda x, f=f, c=c: -((x["iv"] - x[f]) > c).astype(float))
+    train, test = split
+    rules = short_rules(cutoffs, iv_name)
     cand = {name: _strategy_stats(rule(train), train, h)[0] for name, rule in rules.items()}
     cand = pd.DataFrame({k: {"앞 기간 샤프": v["샤프(연)"], "앞 기간 거래 수": v["거래 수"],
                              "앞 기간 평균 손익(주가 대비)": v["평균 손익(주가 대비)"]} for k, v in cand.items()}).T
@@ -430,6 +481,31 @@ def short_only_split(bt, h=21, cutoffs=SHORT_CUTOFFS, iv_name="IV", min_rows=24)
         rows[name], curves[name] = _strategy_stats(pos, test, h)
     return {"candidates": cand, "chosen": chosen, "test": pd.DataFrame(rows).T, "curves": pd.DataFrame(curves),
             "train_period": (train.index[0], train.index[-1]), "test_period": (test.index[0], test.index[-1])}
+
+
+def short_only_robustness(grid, rule=None, h=21, iv_name="IV"):
+    """'매도만' 검증이 (차이 × 진입일) 조합마다 유지되는지.
+
+    다시 고르기: 각 조합에서 앞 절반으로 규칙을 처음부터 다시 고르고 뒤 절반에서 평가 → 고르는 '방법'이 믿을 만한지.
+    이 규칙 그대로(rule): 이미 고른 규칙을 각 조합의 뒤 절반에 그대로 적용 → 그 규칙이 가정 변화에 버티는지.
+      (규칙을 고른 앞 기간과 겹치지 않는 뒤 절반만 쓰지만, 조합끼리 뒤 기간이 거의 같아서 서로 독립적인 증거는 아니다.)
+    """
+    rules = short_rules(iv_name=iv_name)
+    rows = []
+    for (g, o), bt in sorted(grid.items()):
+        cb = add_combined_forecast(bt)
+        so = short_only_split(cb, h=h, iv_name=iv_name)
+        if so is None:
+            continue
+        test = _split_half(cb)[1]
+        al, ch = so["test"].loc["항상 매도"], so["test"].loc["고른 규칙"]
+        row = {"차이": f"{g * 100:g}%p", "진입": f"{o}거래일 늦게", "다시 고른 규칙": so["chosen"],
+               "다시 고른 규칙 샤프": ch["샤프(연)"], "다시 고른 규칙 t값": ch["t값"], "항상 매도 샤프": al["샤프(연)"]}
+        if rule is not None and rule in rules:
+            fx = _strategy_stats(rules[rule](test), test, h)[0]
+            row.update({"이 규칙 샤프": fx["샤프(연)"], "이 규칙 t값": fx["t값"], "이 규칙 거래 수": fx["거래 수"]})
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def simulate_gbm_paths(S0, vol, r, T, n_steps, n_paths, rng):
