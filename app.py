@@ -17,7 +17,7 @@ import ui
 import universe as uv
 from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, add_combined_forecast,
                           forecast_errors, max_drawdown, short_only_split, simulate_gbm_paths, summarize_vol_backtest,
-                          var_es, vol_backtest_robustness, vol_signal_backtest)
+                          short_only_robustness, var_es, vol_backtest_robustness, vol_signal_backtest)
 
 st.set_page_config(page_title="변동성 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -102,8 +102,7 @@ def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spre
     if bt.empty:
         raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 2년 필요)")
     table, curves = summarize_vol_backtest(bt)
-    by_gap, by_offset = vol_backtest_robustness(close, iv, bt, **kw)
-    return {"bt": bt, "table": table, "curves": curves, "by_gap": by_gap, "by_offset": by_offset}
+    return {"bt": bt, "table": table, "curves": curves, **vol_backtest_robustness(close, iv, bt, **kw)}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -857,6 +856,47 @@ with tab3:
                     st.caption(f"규칙: 'IV − 예측 변동성'이 기준보다 크면 그달 ATM 스트래들을 팔고(매일 델타헤지), 아니면 쉽니다. "
                                "후보는 예측 2가지(GARCH, 결합) × 기준 8가지와 '항상 매도'이고, 앞 기간 샤프가 가장 높은 것을 골랐습니다. "
                                "뒤 기간이 3~4년 정도라 표본이 작으니 t값을 함께 보세요.")
+
+                    # ---- '매도만' 결과가 가정(IV 차이·진입일)을 바꿔도 유지되는지
+                    fixed = so["chosen"] if so["chosen"] != "항상 매도" else None
+                    rob = short_only_robustness(res["grid"], rule=fixed, iv_name="IV")
+                    n_rob = len(rob)
+                    gaps_s, offs_s = list(dict.fromkeys(rob["차이"])), list(dict.fromkeys(rob["진입"]))
+                    st.markdown(f"**'매도만' 결과는 가정을 바꿔도 유지될까?** — {vix_name}와 ATM IV의 차이 {len(gaps_s)}가지 × "
+                                f"진입일 {len(offs_s)}가지 = {n_rob}개 조합")
+                    re_win = int(((rob["다시 고른 규칙"] != "항상 매도") & (rob["다시 고른 규칙 샤프"] > rob["항상 매도 샤프"])).sum())
+                    re_t = int((rob["다시 고른 규칙 t값"] > 2).sum())
+                    re_desc = (f"다시 고르기: 조합마다 앞 기간으로 규칙을 처음부터 다시 골랐을 때, '항상 매도'가 아닌 규칙이 골라져 "
+                               f"뒤 기간에 더 나았던 조합 {re_win} / {n_rob}, 고른 규칙의 뒤 기간 t값이 2를 넘은 조합 {re_t} / {n_rob}.")
+                    if fixed is not None:
+                        diff = rob["이 규칙 샤프"] - rob["항상 매도 샤프"]
+                        win = int((diff > 0).sum())
+                        n_sig = int((rob["이 규칙 t값"] > 2).sum())
+                        share, sig_share = win / n_rob, n_sig / n_rob
+                        # 샤프가 앞서는 조합이 많아도 t값이 대부분 2 미만이면 '방향은 같지만 우연과 구분이 어렵다'로 본다
+                        label, kind = (("대부분 조합에서 유지", "approve") if share >= 0.8 and sig_share >= 0.5 else
+                                       ("방향은 일관 · 우연과 구분은 어려움", "elective") if share >= 0.8 else
+                                       ("조합에 따라 엇갈림", "elective") if share >= 0.5 else ("일부 조합에서만 좋음", "reject"))
+                        ui.verdict("이 규칙 그대로 · 앞에서 고른 규칙을 모든 조합의 뒤 기간에 적용", f"{win} / {n_rob}",
+                                   "조합에서 뒤 기간에 항상 매도보다 나음", [(label, kind), (f"t > 2인 조합 {n_sig} / {n_rob}", "neutral")],
+                                   f"규칙: {fixed}. " + re_desc)
+                        diff_name = "샤프 차이 (이 규칙 − 항상 매도)"
+                    else:
+                        diff = rob["다시 고른 규칙 샤프"] - rob["항상 매도 샤프"]
+                        ui.verdict("다시 고르기", f"{re_win} / {n_rob}", "조합에서 다시 고른 규칙이 항상 매도보다 나음", [], re_desc)
+                        diff_name = "샤프 차이 (다시 고른 규칙 − 항상 매도)"
+                    piv = rob.assign(d=diff).pivot(index="차이", columns="진입", values="d").reindex(index=gaps_s, columns=offs_s)
+                    st.markdown(f"{diff_name}, 뒤 기간 — 행: {vix_name}와 ATM IV의 차이, 열: 첫 진입일")
+                    st.dataframe(piv.style.format("{:+.2f}").map(
+                        lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
+                    with st.expander("조합별 자세히"):
+                        st.dataframe(rob.style.format({c: "{:.2f}" for c in rob.columns if "샤프" in c} |
+                                                      {c: "{:+.1f}" for c in rob.columns if "t값" in c} |
+                                                      {"이 규칙 거래 수": "{:.0f}"}, na_rep="—"), hide_index=True, width="stretch")
+                    st.caption("+면 그 조합에서 고정 규칙(또는 다시 고른 규칙)이 뒤 기간에 '항상 매도'보다 샤프가 높았다는 뜻입니다. "
+                               "대부분의 칸이 +이면 가정에 덜 민감한 결과이고, 몇 칸만 +이면 우연일 가능성이 큽니다. "
+                               "단, 조합끼리 뒤 기간이 거의 같은 시기라 20개가 서로 독립적인 증거는 아닙니다 — "
+                               "'가정을 바꿔도 버티는지'를 보는 점검이지, 표본을 20배로 늘린 것이 아닙니다.")
 
 # ---------------- 4. 백테스트 ----------------
 with tab4:

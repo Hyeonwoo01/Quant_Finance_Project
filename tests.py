@@ -252,6 +252,17 @@ _p = simulate_gbm_paths(100, 0.25, 0.02, 21 / 252, 21, 1, np.random.default_rng(
 _g, _n = _e.hedged_pnl(_p, 1, 0.0), _e.hedged_pnl(_p, 1, 5.0)
 assert abs(_e.hedged_pnl(_p, -1, 5.0) - (-_g - (_g - _n))) < 1e-10
 
+# 여러 진입을 한 번에 계산하는 헤지 손익 == 진입 하나씩 엔진으로 계산한 값 (만기·IV가 진입마다 달라도)
+from quant_engine import hedged_straddle_pnl, straddle_price
+_rng = np.random.default_rng(8)
+_P = simulate_gbm_paths(100, 0.3, 0.02, 30 / 365, 21, 6, _rng) * _rng.uniform(0.5, 2.0, (6, 1))
+_T, _S = _rng.uniform(25, 35, 6) / 365, _rng.uniform(0.1, 0.5, 6)
+for c in (0.0, 3.0):
+    _one = [GammaScalpingEngine(p[0], p[0], t, 0.02, sg, 0.01).hedged_pnl(p, 1, c) for p, t, sg in zip(_P, _T, _S)]
+    assert np.allclose(hedged_straddle_pnl(_P, _T, 0.02, _S, 0.01, c), _one)
+assert np.allclose(straddle_price(_P[:, 0], _P[:, 0], _T, 0.02, _S, 0.01),
+                   [GammaScalpingEngine(p[0], p[0], t, 0.02, sg, 0.01).straddle_greeks()["price"] for p, t, sg in zip(_P, _T, _S)])
+
 # 변동성 신호 백테스트: IV가 실제보다 늘 10%p 비싸면 '매도' 신호가 나고 이익이어야 한다 + 미래 정보 누출 없음
 _rng = np.random.default_rng(21)
 _idx = pd.bdate_range("2015-01-01", periods=1400)
@@ -276,8 +287,11 @@ assert np.allclose(_lo["garch"], vb["garch"]) and np.allclose(_lo["iv"], 0.28) a
 assert (-_lo["long"]).mean() < (-vb["long"]).mean() and (_lo["premium"] < vb["premium"]).all()
 _late = vol_signal_backtest(_px, _iv, cost_bps=1.0, offset=5)
 assert _late.index[0] == _idx[505] and vb.index[0] == _idx[500]
-gtab, otab = vol_backtest_robustness(_px, _iv, vb, cost_bps=1.0, gaps=(0.0, 0.02), offsets=(0, 5))
+rb = vol_backtest_robustness(_px, _iv, vb, cost_bps=1.0, gaps=(0.0, 0.02), offsets=(0, 5))
+gtab, otab = rb["by_gap"], rb["by_offset"]
 assert list(gtab.index) == ["0%p", "2%p"] and gtab.loc["0%p", "진입 수"] == len(vb)
+assert set(rb["grid"]) == {(0.0, 0), (0.02, 0), (0.0, 5), (0.02, 5)} and rb["grid"][(0.0, 0)] is vb
+assert np.allclose(rb["grid"][(0.02, 5)]["garch"], rb["grid"][(0.0, 5)]["garch"])        # 같은 진입일이면 예측 재사용
 assert gtab.loc["2%p", "항상 매도 평균 손익(주가 대비)"] < gtab.loc["0%p", "항상 매도 평균 손익(주가 대비)"]
 assert otab.loc["5거래일 늦게", "첫 진입일"] == _idx[505].date()
 
@@ -313,6 +327,14 @@ _half = 24 + (_k - 24) // 2
 _bs2.iloc[_half:, _bs2.columns.get_loc("long")] *= -1                # 뒤 기간 손익만 뒤집음
 assert short_only_split(add_combined_forecast(_bs2), iv_name="VIX")["chosen"] == so["chosen"]
 assert short_only_split(add_combined_forecast(_bs.iloc[:40]), iv_name="VIX") is None   # 표본 부족
+
+# '매도만' 견고성: 모든 조합에서 통하는 데이터면 고정 규칙이 늘 항상 매도보다 낫고, 뒤 기간을 뒤집으면 못해야 한다
+from quant_engine import short_only_robustness
+rob = short_only_robustness({(0.0, 0): _bs, (0.01, 0): _bs, (0.0, 4): _bs.iloc[2:]}, rule=so["chosen"], iv_name="VIX")
+assert len(rob) == 3 and (rob["이 규칙 샤프"] > rob["항상 매도 샤프"]).all() and (rob["다시 고른 규칙"] != "항상 매도").all()
+rob2 = short_only_robustness({(0.0, 0): _bs2}, rule=so["chosen"], iv_name="VIX")
+assert (rob2["이 규칙 샤프"] < rob2["항상 매도 샤프"]).all()
+assert "이 규칙 샤프" not in short_only_robustness({(0.0, 0): _bs}, rule=None, iv_name="VIX")
 
 # ---------------- 시장 국면 ----------------
 _rng = np.random.default_rng(7)
