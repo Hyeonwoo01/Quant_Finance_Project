@@ -15,8 +15,9 @@ import market_data as md
 import regime as rg
 import ui
 import universe as uv
-from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, max_drawdown,
-                          simulate_gbm_paths, summarize_vol_backtest, var_es, vol_signal_backtest)
+from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, add_combined_forecast,
+                          forecast_errors, max_drawdown, short_only_split, simulate_gbm_paths, summarize_vol_backtest,
+                          var_es, vol_signal_backtest)
 
 st.set_page_config(page_title="변동성 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -756,10 +757,10 @@ with tab3:
                            f"비교: 항상 변동성 매도 샤프 {sh['샤프(연)']:.2f}, 항상 매수 {lg['샤프(연)']:.2f}. "
                            f"신호는 매수 {int((vbt['signal'] == 1).sum())}번 · 매도 {int((vbt['signal'] == -1).sum())}번 · "
                            f"관망 {int((vbt['signal'] == 0).sum())}번이었습니다.")
-                st.dataframe(vtab.set_index("전략").style.format({
-                    "거래 수": "{:.0f}", "승률": "{:.0%}", "평균 손익(주가 대비)": "{:+.2%}", "평균 손익(프리미엄 대비)": "{:+.1%}",
-                    "t값": "{:+.1f}", "샤프(연)": "{:.2f}", "최대 낙폭": "{:.0%}", "최악 1회": "{:+.1%}"}, na_rep="—"),
-                    width="stretch")
+                vfmt = {"거래 수": "{:.0f}", "승률": "{:.0%}", "평균 손익(주가 대비)": "{:+.2%}",
+                        "평균 손익(프리미엄 대비)": "{:+.1%}", "t값": "{:+.1f}", "샤프(연)": "{:.2f}", "최대 낙폭": "{:.0%}",
+                        "최악 1회": "{:+.1%}"}
+                st.dataframe(vtab.set_index("전략").style.format(vfmt, na_rep="—"), width="stretch")
                 fig = go.Figure()
                 for name, color in zip(vcurves.columns, (ui.BLUE, ui.AMBER, ui.PURPLE)):
                     fig.add_trace(go.Scatter(x=vcurves.index, y=vcurves[name], name=name, line=dict(color=color)))
@@ -775,6 +776,52 @@ with tab3:
                 st.caption(f"{vix_name}는 외가격 옵션까지 섞어 계산해서 실제 ATM 옵션 IV보다 보통 1~3%p 높습니다. 그래서 '항상 매도' 성적이 "
                            "실제보다 좋게 나올 수 있습니다. 옵션 호가 차이(스프레드)는 넣지 않았고, 금리·배당은 현재 값으로 고정했습니다. "
                            "평균 VRP를 보고 사이드바 VRP를 맞춘 뒤 다시 돌리면 과거를 보고 맞춘 것이라 성적이 부풀려집니다.")
+
+                # ---- (1) IV를 예측에 같이 쓰기
+                vbt2 = add_combined_forecast(vbt)
+                ferr, n_err = forecast_errors(vbt2, vix_name)
+                st.markdown(f"**{vix_name}를 예측에 같이 쓰면 더 정확할까?** — 같은 {n_err}번의 진입에서, 앞으로 21일 실제 변동성을 "
+                            "얼마나 맞혔는지 비교")
+                tcol = "GARCH 대비 개선 t값"                 # GARCH 자기 자신은 비교 대상이 없음 → '—' (빈 값은 Streamlit이 None으로 표시)
+                fshow = ferr.assign(**{tcol: ferr[tcol].map(lambda v: "—" if pd.isna(v) else f"{v:+.1f}")})
+                st.dataframe(fshow.style.format({"예측 오차(RMSE)": "{:.1%}", "평균 치우침": "{:+.1%}"}), width="stretch",
+                             column_config={tcol: st.column_config.TextColumn(tcol, alignment="right")})
+                best = ferr["예측 오차(RMSE)"].astype(float).idxmin()
+                st.caption(f"가장 정확했던 예측: **{best}**. 결합 예측은 '실제 변동성 ≈ a + b·GARCH + c·{vix_name}'의 a·b·c를 "
+                           f"매번 이미 결과가 나온 과거 진입들로만 다시 추정해 만들었습니다(처음 24번은 추정용이라 비교에서 제외). "
+                           "평균 치우침이 +면 실제보다 높게 예측했다는 뜻이고, 개선 t값이 2를 넘어야 GARCH보다 낫다는 게 우연이 아닙니다.")
+
+                # ---- (2) 매도만: 앞 기간으로 고르고 뒤 기간에서 검증
+                so = short_only_split(vbt2, iv_name=vix_name)
+                st.markdown("**매도만 하는 규칙 — 앞 기간으로 고르고 뒤 기간에서 검증**")
+                if so is None:
+                    st.caption("표본이 부족해 이 검증을 할 수 없습니다 (결합 예측이 있는 진입이 24번 이상 필요).")
+                else:
+                    tt = so["test"]
+                    ch, al, sg2 = tt.loc["고른 규칙"], tt.loc["항상 매도"], tt.loc["GARCH 신호대로 (사이드바 설정)"]
+                    (a0, a1), (b0, b1) = so["train_period"], so["test_period"]
+                    tags = [("뒤 기간 이익이 우연이 아님 (t > 2)", "approve") if ch["t값"] > 2 else ("뒤 기간 이익이 우연일 수 있음", "elective")]
+                    if so["chosen"] != "항상 매도":
+                        tags.append(("뒤 기간에 항상 매도보다 나음", "approve") if ch["샤프(연)"] > al["샤프(연)"]
+                                    else ("뒤 기간에 항상 매도보다 못함", "elective"))
+                    ui.verdict(f"앞 기간 {a0.date()} ~ {a1.date()} 성적으로 고른 규칙", so["chosen"], "", tags,
+                               f"뒤 기간 {b0.date()} ~ {b1.date()} ({len(so['curves'])}번)의 샤프: 고른 규칙 {ch['샤프(연)']:.2f}, "
+                               f"항상 매도 {al['샤프(연)']:.2f}, GARCH 신호대로 {sg2['샤프(연)']:.2f}. "
+                               "뒤 기간은 규칙을 고를 때 전혀 쓰지 않았으므로 '처음 보는 데이터'에서의 성적입니다.")
+                    st.dataframe(tt.style.format(vfmt, na_rep="—"), width="stretch")
+                    fig = go.Figure()
+                    for name, color in zip(so["curves"].columns, (ui.BLUE, ui.AMBER, ui.NEUTRAL)):
+                        fig.add_trace(go.Scatter(x=so["curves"].index, y=so["curves"][name], name=name, line=dict(color=color)))
+                    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                                      yaxis_title="뒤 기간 누적 (시작=1)", legend=dict(orientation="h", y=1.12))
+                    ui.chart(fig)
+                    with st.expander("앞 기간 후보 규칙별 성적"):
+                        st.dataframe(so["candidates"].sort_values("앞 기간 샤프", ascending=False).style.format(
+                            {"앞 기간 샤프": "{:.2f}", "앞 기간 거래 수": "{:.0f}", "앞 기간 평균 손익(주가 대비)": "{:+.2%}"},
+                            na_rep="—"), width="stretch")
+                    st.caption(f"규칙: '{vix_name} − 예측 변동성'이 기준보다 크면 그달 ATM 스트래들을 팔고(매일 델타헤지), 아니면 쉽니다. "
+                               "후보는 예측 2가지(GARCH, 결합) × 기준 8가지와 '항상 매도'이고, 앞 기간 샤프가 가장 높은 것을 골랐습니다. "
+                               "뒤 기간이 3~4년 정도라 표본이 작으니 t값을 함께 보세요.")
 
 # ---------------- 4. 백테스트 ----------------
 with tab4:
