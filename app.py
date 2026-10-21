@@ -191,8 +191,11 @@ rv_opt = garch.forecast_vol(opt_days)
 
 logic = VolatilityTradingLogic(vrp=vrp, threshold=threshold)
 signal = logic.generate_signal(rv_opt, market_iv) if market_iv is not None else None
-if signal is not None:   # "SHORT_VOL (변동성 매도)" → 코드 / 한글 이름
-    sig_code, sig_name = VolatilityTradingLogic.LABELS[signal].rstrip(")").split(" (")
+# 신호는 매매 추천이 아니라 '옵션이 예측에 비해 얼마나 비싼지'로만 보여준다 — 과거 검증(SPY, VIX 기준)에서
+# 이 차이로 타이밍을 잡는 매매는 우위가 확인되지 않았다. 계산·검증(백테스트)은 그대로 둔다.
+PRICE_LEVEL = {-1: "예측보다 많이 비쌈", 0: "보통 수준", 1: "예측보다 쌈"}
+iv_gap_now = (market_iv - rv_opt) if market_iv is not None else None     # IV − GARCH 예측
+normal_band = f"보통 범위 {(vrp - threshold) * 100:+.0f} ~ {(vrp + threshold) * 100:+.0f}%p"
 
 
 # ---------------- 상단 요약 카드 ----------------
@@ -204,9 +207,9 @@ def show_hero(dir_metric):
                 [(f"예측 변동성 · {horizon}일", f"{rv_h:.1%}",
                   f"1년 기준 환산 · 평소 수준 {np.sqrt(garch.long_run_var * 252):.1%}", False),
                  ("시장 기대 변동성 (IV)", f"{market_iv:.1%}" if market_iv is not None else "—", iv_note, False),
-                 ("변동성 신호", sig_name if signal is not None else "—",
-                  f"{sig_code} · edge {logic.edge(rv_opt, market_iv):+.1%}" if market_iv is not None else "IV 필요",
-                  signal is not None and signal != 0),
+                 ("옵션 가격 수준", PRICE_LEVEL[signal] if signal is not None else "—",
+                  f"IV − GARCH 예측 {iv_gap_now * 100:+.1f}%p · {normal_band}" if signal is not None else "IV 필요",
+                  False),
                  dir_metric],
                 "모든 수치는 그 시점까지의 데이터로만 계산한 추정치이며, 투자 조언이 아닙니다.")
 
@@ -227,7 +230,7 @@ show_hero((f"{dir_h}일 뒤 상승 확률", f"{p_up:.0%}" if p_up is not None el
 
 tab1, tab_dir, tab_pick, tab_snap, tab2, tab_regime, tab3, tab4 = st.tabs(
     ["주가 예측 범위", "방향 예측", "코스피 종목 고르기", "시장 심리", "변동성", "시장 국면",
-     "신호 & 헤지 손익", "예측 정확도 검증"])
+     "옵션 가격 & 헤지 손익", "예측 정확도 검증"])
 
 # ---------------- 1. 주가 예측 범위 ----------------
 with tab1:
@@ -679,16 +682,20 @@ with tab_regime:
         st.caption("확률이 50% 이상인 날 종가에 팔고 다음 날부터 현금(이자 0으로 계산), 50% 아래로 내려오면 다시 삽니다. "
                    "국면 분류는 보통 수익을 늘리기보다 큰 하락을 줄이는 도구입니다. 상승장 초입을 놓치는 대가가 따릅니다.")
 
-# ---------------- 3. 신호 & 헤지 손익 ----------------
+# ---------------- 3. 옵션 가격 & 헤지 손익 ----------------
 with tab3:
-    ui.section("Signal & Hedge P&L", "변동성 매수·매도 신호와 델타헤지 손익",
-               "옵션 가격에 담긴 시장의 기대 변동성(IV)이 모델 예측보다 충분히 높으면 옵션이 비싸다고 보고 '변동성 매도', "
-               "충분히 낮으면 싸다고 보고 '변동성 매수' 신호를 냅니다.")
+    ui.section("Option Pricing & Hedge P&L", "옵션 가격 수준과 델타헤지 손익",
+               "옵션 가격에 담긴 시장의 기대 변동성(IV)이 GARCH 예측보다 얼마나 높은지 보여줍니다. "
+               "매매 추천이 아니라, 옵션이 지금 예측에 비해 얼마나 비싼지 재는 정보입니다.")
     if market_iv is None:
-        st.warning("이 종목은 옵션 데이터가 없어 신호를 낼 수 없습니다. 사이드바에서 '시장 기대 변동성(IV) 직접 입력'을 켜세요.")
+        st.warning("이 종목은 옵션 데이터가 없어 옵션 가격 수준을 잴 수 없습니다. 사이드바에서 '시장 기대 변동성(IV) 직접 입력'을 켜세요.")
     else:
-        edge = logic.edge(rv_opt, market_iv)
-        ui.verdict(f"edge {edge:+.2%} · 관망 구간 ±{threshold:.1%}", sig_name, "", [(sig_code, "neutral")])
+        ui.verdict("옵션 가격 수준 · IV와 GARCH 예측 비교", PRICE_LEVEL[signal],
+                   f"IV − 예측 {iv_gap_now * 100:+.1f}%p", [("매매 추천 아님", "neutral")],
+                   f"VRP {vrp * 100:g}%p ± 관망 구간 {threshold * 100:g}%p, 즉 {normal_band}이면 '보통 수준'으로 봅니다.")
+        st.info("이 차이로 사고팔 타이밍을 잡는 전략은 과거 검증(SPY, VIX 기준)에서 우위가 확인되지 않았습니다. "
+                "옵션은 대체로 실제 변동성보다 비싸게 거래되지만(변동성 위험 프리미엄), 그 차이가 클 때와 작을 때를 "
+                "GARCH로 골라도 성적이 나아지지 않았습니다. 아래 **과거 성적**에서 종목별로 직접 확인할 수 있습니다.")
         st.markdown(f"""
 | 항목 | 값 |
 |---|---|
@@ -698,9 +705,8 @@ with tab3:
 | **edge = IV − (RV + VRP)** | **{logic.edge(rv_opt, market_iv):+.2%}** (관망 구간 ±{threshold:.1%}) |
 | 무위험 금리 ({r_src}) / 배당수익률 | {r:.2%} / {q:.2%} |
 """)
-        position = signal if signal != 0 else st.radio(
-            "지금은 관망 신호입니다. 손익을 시험해 볼 방향을 고르세요:", [1, -1],
-            format_func=lambda p: VolatilityTradingLogic.LABELS[p], horizontal=True)
+        position = st.radio("델타헤지 손익을 시험해 볼 포지션", [1, -1], horizontal=True,
+                            format_func={1: "스트래들 매수 (롱 감마)", -1: "스트래들 매도 (숏 감마)"}.get)
 
         eng = GammaScalpingEngine(spot, spot, opt_T, r, market_iv, q)
         gk = eng.straddle_greeks()
@@ -733,7 +739,7 @@ with tab3:
             st.warning("변동성 매도는 예측이 맞으면 꾸준히 벌지만, 실제 변동성이 시장 기대(IV)를 넘으면 손실이 크게 날 수 있습니다. "
                        "포지션 크기를 제한하고 손절 기준을 꼭 정하세요.")
 
-    st.subheader("과거 성적 — 이 신호대로 거래했다면?")
+    st.subheader("과거 성적 — 이 차이로 사고팔았다면?")
     vix_sym = md.VOL_INDEX.get(ticker.upper())
     if vix_sym is None:
         st.caption("과거 IV가 필요해서 변동성 지수가 있는 종목만 검증할 수 있습니다: SPY·VOO·IVV (VIX), QQQ (VXN), IWM (RVX).")
