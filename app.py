@@ -17,7 +17,7 @@ import ui
 import universe as uv
 from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, add_combined_forecast,
                           forecast_errors, max_drawdown, short_only_split, simulate_gbm_paths, summarize_vol_backtest,
-                          var_es, vol_signal_backtest)
+                          var_es, vol_backtest_robustness, vol_signal_backtest)
 
 st.set_page_config(page_title="변동성 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -88,15 +88,22 @@ def get_universe(h, cost_bps, data_stamp):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q):
-    """변동성 지수(VIX 등)를 과거 IV로 써서 변동성 신호를 워크포워드 검증 (최대 10년). 지수가 없으면 None."""
+def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spread):
+    """변동성 지수(VIX 등) − iv_gap 을 과거 ATM IV로 써서 변동성 신호를 워크포워드 검증 (최대 10년) + 현실성 점검.
+
+    지수가 없으면 None.
+    """
     iv = md.load_vol_index(ticker, 10)
     if iv is None:
         return None
-    bt = vol_signal_backtest(md.load_history(ticker, 10), iv, vrp, threshold, cost_bps=cost_bps, r=r, q=q)
+    close = md.load_history(ticker, 10)
+    kw = dict(vrp=vrp, threshold=threshold, cost_bps=cost_bps, r=r, q=q, iv_gap=iv_gap, option_spread=option_spread)
+    bt = vol_signal_backtest(close, iv, **kw)
     if bt.empty:
         raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 2년 필요)")
-    return (bt, *summarize_vol_backtest(bt))
+    table, curves = summarize_vol_backtest(bt)
+    by_gap, by_offset = vol_backtest_robustness(close, iv, bt, **kw)
+    return {"bt": bt, "table": table, "curves": curves, "by_gap": by_gap, "by_offset": by_offset}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -732,27 +739,35 @@ with tab3:
         st.caption("과거 IV가 필요해서 변동성 지수가 있는 종목만 검증할 수 있습니다: SPY·VOO·IVV (VIX), QQQ (VXN), IWM (RVX).")
     else:
         vix_name = vix_sym.lstrip("^")
-        st.markdown(f"과거 {vix_name}(30일 만기 옵션에 담긴 시장 기대 변동성)를 그날의 IV로 보고, 한 달(21거래일)마다 "
-                    "그때까지의 데이터로만 GARCH 예측 → 신호 → ATM 스트래들 진입 → 매일 델타헤지 → 만기 정산을 반복합니다. "
-                    "사이드바의 VRP·관망 구간·거래비용을 그대로 씁니다.")
+        st.markdown(f"과거 {vix_name}(30일 만기 옵션에 담긴 시장 기대 변동성)에서 아래 차이를 뺀 값을 그날의 ATM IV로 보고, "
+                    "한 달(21거래일)마다 그때까지의 데이터로만 GARCH 예측 → 신호 → ATM 스트래들 진입 → 매일 델타헤지 → 만기 정산을 "
+                    "반복합니다. 사이드바의 VRP·관망 구간·거래비용(주식 헤지)을 그대로 씁니다.")
+        o1, o2 = st.columns(2)
+        iv_gap = o1.number_input(f"{vix_name}와 실제 ATM IV의 차이 (%p)", 0.0, 5.0, 2.0, 0.5,
+                                 help=f"{vix_name}는 외가격 옵션까지 섞어 계산해서 ATM 옵션 IV보다 보통 1~3%p 높습니다. "
+                                      "IV = 지수 − 이 값으로 계산합니다.") / 100
+        opt_spread = o2.number_input("옵션 체결 비용 (스트래들 가격 대비 %)", 0.0, 10.0, 1.0, 0.5,
+                                     help="중간 가격보다 불리하게 사고파는 비용(호가 차이의 절반). 진입할 때 한 번 냅니다. "
+                                          "거래가 많은 대형 ETF 옵션은 작고, 거래가 적은 옵션은 큽니다.") / 100
         if st.button("과거 성적 계산", type="primary", key="vol_bt"):
             try:
-                with st.spinner("최대 10년치를 한 달씩 다시 예측하는 중…"):
-                    res = get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q)
+                with st.spinner("최대 10년치를 한 달씩 다시 예측하고, 차이·진입일을 바꿔 가며 점검하는 중…"):
+                    res = get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, opt_spread)
             except Exception as e:
                 res = "error"
                 st.error(f"계산 실패: {e}")
             if res is None:
                 st.warning(f"{vix_name} 데이터를 불러오지 못했습니다.")
             elif res != "error":
-                vbt, vtab, vcurves = res
+                vbt, vtab, vcurves = res["bt"], res["table"], res["curves"]
                 sg, sh, lg = vtab.loc["signal"], vtab.loc["short"], vtab.loc["long"]
                 if sg["거래 수"] == 0:
                     tags = [("신호가 한 번도 나지 않음", "neutral")]
                 else:
                     tags = [("이익이 우연이 아님 (t > 2)", "approve") if sg["t값"] > 2 else ("이익이 우연일 수 있음", "elective"),
                             ("항상 매도보다 나음", "approve") if sg["샤프(연)"] > sh["샤프(연)"] else ("항상 매도보다 못함", "elective")]
-                ui.verdict(f"{vbt.index[0].date()} ~ {vbt.index[-1].date()} · 진입 {len(vbt)}번 · {vix_name} 기준",
+                ui.verdict(f"{vbt.index[0].date()} ~ {vbt.index[-1].date()} · 진입 {len(vbt)}번 · "
+                           f"IV = {vix_name} − {iv_gap * 100:g}%p · 옵션 체결 비용 {opt_spread:.1%}",
                            f"샤프 {sg['샤프(연)']:.2f}", "GARCH 신호대로 (연)", tags,
                            f"비교: 항상 변동성 매도 샤프 {sh['샤프(연)']:.2f}, 항상 매수 {lg['샤프(연)']:.2f}. "
                            f"신호는 매수 {int((vbt['signal'] == 1).sum())}번 · 매도 {int((vbt['signal'] == -1).sum())}번 · "
@@ -769,17 +784,31 @@ with tab3:
                 ui.chart(fig)
                 k1, k2, k3 = st.columns(3)
                 k1.metric("과거 평균 VRP", f"{(vbt['iv'] - vbt['realized']).mean():+.1%}",
-                          f"{vix_name} − 이후 21일 실제 변동성", delta_color="off")
+                          "IV − 이후 21일 실제 변동성", delta_color="off")
                 vrmse = lambda c: np.sqrt(np.mean((vbt[c] - vbt["realized"]) ** 2))
                 k2.metric("GARCH 예측 오차", f"{vrmse('garch'):.1%}", "실제 변동성 대비 RMSE", delta_color="off")
-                k3.metric(f"{vix_name} 예측 오차", f"{vrmse('iv'):.1%}", "실제 변동성 대비 RMSE", delta_color="off")
-                st.caption(f"{vix_name}는 외가격 옵션까지 섞어 계산해서 실제 ATM 옵션 IV보다 보통 1~3%p 높습니다. 그래서 '항상 매도' 성적이 "
-                           "실제보다 좋게 나올 수 있습니다. 옵션 호가 차이(스프레드)는 넣지 않았고, 금리·배당은 현재 값으로 고정했습니다. "
-                           "평균 VRP를 보고 사이드바 VRP를 맞춘 뒤 다시 돌리면 과거를 보고 맞춘 것이라 성적이 부풀려집니다.")
+                k3.metric("IV 예측 오차", f"{vrmse('iv'):.1%}", "실제 변동성 대비 RMSE", delta_color="off")
+                st.caption(f"이 화면의 IV = {vix_name} − {iv_gap * 100:g}%p입니다. 실제 차이는 시기마다 달라서 아래 '차이를 바꿔 보면' 표로 함께 "
+                           "확인하세요. 금리·배당은 현재 값으로 고정했습니다. 평균 VRP를 보고 사이드바 VRP를 맞춘 뒤 다시 돌리면 "
+                           "과거를 보고 맞춘 것이라 성적이 부풀려집니다.")
+
+                # ---- 현실성 점검: IV 차이와 진입일
+                rfmt = {"진입 수": "{:.0f}", "항상 매도 평균 손익(주가 대비)": "{:+.2%}", "항상 매도 t값": "{:+.1f}",
+                        "항상 매도 샤프": "{:.2f}", "항상 매도 최대 낙폭": "{:.0%}", "신호대로 샤프": "{:.2f}", "신호대로 t값": "{:+.1f}"}
+                st.markdown(f"**현실성 점검 ① {vix_name}와 ATM IV의 차이를 바꿔 보면** (다른 설정은 그대로)")
+                st.dataframe(res["by_gap"].drop(columns="첫 진입일").style.format(rfmt, na_rep="—"), width="stretch")
+                st.caption("한 달짜리 ATM 스트래들은 IV가 1%p 낮으면 받는 가격이 주가의 약 0.23% 줄어듭니다. "
+                           "그래서 차이를 크게 볼수록 '항상 매도'의 이익이 줄어듭니다. 0%p 줄이 지수를 그대로 쓴 예전 결과입니다.")
+                st.markdown("**현실성 점검 ② 진입일을 바꿔 보면** (첫 진입을 며칠씩 늦춰 같은 계산을 반복)")
+                st.dataframe(res["by_offset"].style.format(rfmt, na_rep="—"), width="stretch")
+                so_sh = res["by_offset"]["항상 매도 샤프"].astype(float)
+                sg_sh = res["by_offset"]["신호대로 샤프"].astype(float)
+                st.caption(f"진입일에 따라 항상 매도 샤프는 {so_sh.min():.2f} ~ {so_sh.max():.2f}, 신호대로 샤프는 "
+                           f"{sg_sh.min():.2f} ~ {sg_sh.max():.2f} 사이였습니다. 폭이 넓을수록 결과에 진입일 운이 많이 섞여 있다는 뜻입니다.")
 
                 # ---- (1) IV를 예측에 같이 쓰기
                 vbt2 = add_combined_forecast(vbt)
-                ferr, n_err = forecast_errors(vbt2, vix_name)
+                ferr, n_err = forecast_errors(vbt2, "IV")
                 st.markdown(f"**{vix_name}를 예측에 같이 쓰면 더 정확할까?** — 같은 {n_err}번의 진입에서, 앞으로 21일 실제 변동성을 "
                             "얼마나 맞혔는지 비교")
                 tcol = "GARCH 대비 개선 t값"                 # GARCH 자기 자신은 비교 대상이 없음 → '—' (빈 값은 Streamlit이 None으로 표시)
@@ -787,12 +816,12 @@ with tab3:
                 st.dataframe(fshow.style.format({"예측 오차(RMSE)": "{:.1%}", "평균 치우침": "{:+.1%}"}), width="stretch",
                              column_config={tcol: st.column_config.TextColumn(tcol, alignment="right")})
                 best = ferr["예측 오차(RMSE)"].astype(float).idxmin()
-                st.caption(f"가장 정확했던 예측: **{best}**. 결합 예측은 '실제 변동성 ≈ a + b·GARCH + c·{vix_name}'의 a·b·c를 "
+                st.caption(f"가장 정확했던 예측: **{best}**. 결합 예측은 '실제 변동성 ≈ a + b·GARCH + c·IV'의 a·b·c를 "
                            f"매번 이미 결과가 나온 과거 진입들로만 다시 추정해 만들었습니다(처음 24번은 추정용이라 비교에서 제외). "
                            "평균 치우침이 +면 실제보다 높게 예측했다는 뜻이고, 개선 t값이 2를 넘어야 GARCH보다 낫다는 게 우연이 아닙니다.")
 
                 # ---- (2) 매도만: 앞 기간으로 고르고 뒤 기간에서 검증
-                so = short_only_split(vbt2, iv_name=vix_name)
+                so = short_only_split(vbt2, iv_name="IV")
                 st.markdown("**매도만 하는 규칙 — 앞 기간으로 고르고 뒤 기간에서 검증**")
                 if so is None:
                     st.caption("표본이 부족해 이 검증을 할 수 없습니다 (결합 예측이 있는 진입이 24번 이상 필요).")
@@ -819,7 +848,7 @@ with tab3:
                         st.dataframe(so["candidates"].sort_values("앞 기간 샤프", ascending=False).style.format(
                             {"앞 기간 샤프": "{:.2f}", "앞 기간 거래 수": "{:.0f}", "앞 기간 평균 손익(주가 대비)": "{:+.2%}"},
                             na_rep="—"), width="stretch")
-                    st.caption(f"규칙: '{vix_name} − 예측 변동성'이 기준보다 크면 그달 ATM 스트래들을 팔고(매일 델타헤지), 아니면 쉽니다. "
+                    st.caption(f"규칙: 'IV − 예측 변동성'이 기준보다 크면 그달 ATM 스트래들을 팔고(매일 델타헤지), 아니면 쉽니다. "
                                "후보는 예측 2가지(GARCH, 결합) × 기준 8가지와 '항상 매도'이고, 앞 기간 샤프가 가장 높은 것을 골랐습니다. "
                                "뒤 기간이 3~4년 정도라 표본이 작으니 t값을 함께 보세요.")
 
