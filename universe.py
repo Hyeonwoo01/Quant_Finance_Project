@@ -269,12 +269,18 @@ def composite_score(R, date, universe, cols):
     return s.where(universe.loc[date])
 
 
-def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridge", "gbm"), progress=None):
-    """매 h일 리밸런싱. 각 시점 t에선 결과가 확정된(날짜 ≤ t−h) 데이터로만 학습·선택한다."""
+def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridge", "gbm"), progress=None,
+                 exec_lag=1):
+    """매 h일 리밸런싱. 각 시점 t에선 결과가 확정된(날짜 ≤ t−h) 데이터로만 학습·선택한다.
+
+    exec_lag: t일 종가까지 보고 고른 뒤 실제로 사고파는 시점까지의 거래일 수.
+              1(기본) = 다음 날 종가에 체결 → 성적은 t+1일 종가부터 h일 수익률로 매긴다. 0 = t일 종가에 체결(낙관적).
+    """
     F, close, universe = panel["feat"], panel["close"], panel["universe"]
     cols = [c for c in FEATURES if panel["coverage"].get(c, 0) > 0.3]       # 데이터가 너무 빈 신호는 제외
     R = {c: cross_rank(F[c], universe) for c in cols}
     fwd = np.log(close.shift(-h) / close)
+    fwd_exec = np.log(close.shift(-h - exec_lag) / close.shift(-exec_lag))   # 실제 체결 이후 h일 수익률 (채점용)
     Y = cross_rank(fwd, universe)                                            # 학습 목표: 수익률 '순위'
     idx = close.index
     first = universe.any(axis=1).values.argmax() + 252 * train_years
@@ -309,14 +315,14 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     rdates = [idx[t] for t in rebal]
     # 모든 모델을 같은 리밸런싱 날짜에 맞춤 (학습 데이터가 부족했던 초기엔 점수 없음 = 전체 보유로 취급)
     scores = {m: pd.DataFrame(v).T.reindex(index=rdates, columns=universe.columns) for m, v in scores.items() if v}
-    fwd_r = fwd.loc[rdates]
+    fwd_r = fwd_exec.loc[rdates]
     ic = {m: s.apply(lambda row: _ic(row, fwd_r.loc[row.name]), axis=1) for m, s in scores.items()}
 
-    # 자동 선택: t에서 이미 결과가 확정된 과거 리밸런싱(t−h 이전)의 IC 평균(최근 12회)이 가장 높은 모델.
+    # 자동 선택: t에서 이미 결과가 확정된 과거 리밸런싱(t−h−exec_lag 이전)의 IC 평균(최근 12회)이 가장 높은 모델.
     # 이력이 6회 미만이면 학습 없는 고정 가중 모델, 모두 0 이하이면 '고르지 않음'(전체 동일가중 = 점수 없음).
     auto, chosen = {}, {}
     for j, d in enumerate(rdates):
-        past = [rdates[k] for k in range(j) if idx.get_loc(rdates[k]) <= idx.get_loc(d) - h][-12:]
+        past = [rdates[k] for k in range(j) if idx.get_loc(rdates[k]) <= idx.get_loc(d) - h - exec_lag][-12:]
         if len(past) < 6:
             pick = "composite"
         else:
@@ -329,7 +335,7 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     scores["auto"] = pd.DataFrame(auto).T
     ic["auto"] = scores["auto"].apply(lambda row: _ic(row, fwd_r.loc[row.name]), axis=1)
     return {"scores": scores, "ic": ic, "chosen": pd.Series(chosen), "rebal": rdates, "fwd": fwd_r,
-            "cols": cols, "R": R, "h": h, "universe": universe}
+            "cols": cols, "R": R, "h": h, "universe": universe, "exec_lag": exec_lag}
 
 
 def _ic(score, fwd):

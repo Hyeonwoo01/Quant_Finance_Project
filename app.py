@@ -17,7 +17,7 @@ import ui
 import universe as uv
 from quant_engine import (GarchVolForecaster, GammaScalpingEngine, VolatilityTradingLogic, add_combined_forecast,
                           forecast_errors, max_drawdown, short_only_split, simulate_gbm_paths, summarize_vol_backtest,
-                          short_only_robustness, var_es, vol_backtest_robustness, vol_signal_backtest)
+                          short_only_robustness, var_backtest, var_es, vol_backtest_robustness, vol_signal_backtest)
 
 st.set_page_config(page_title="변동성 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -50,14 +50,16 @@ def get_direction_inputs(ticker):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_direction(ticker, h, cost_bps):
-    """방향 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
+def get_direction(ticker, h):
+    """방향 모델 학습(무거움). 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다.
+
+    거래비용·체결 시점은 채점(dr.evaluate)에만 쓰이므로 여기 넣지 않는다 → 그 설정을 바꿔도 다시 학습하지 않음.
+    """
     close, macro, alt, alt_status = get_direction_inputs(ticker)
     # 거시 지표 시차는 티커로 자동 결정 (한국 종목이면 미국 지표를 하루 늦춤)
     wf, _ = dr.walk_forward(close, h, macro, alt=alt, ticker=ticker)
     if wf.empty:
         raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 3년 필요)")
-    ev = dr.evaluate(wf, h, np.log(close).diff(), cost_bps)
     p_up, pick, now_all, contrib, asof = dr.predict_now(close, h, wf, macro, alt=alt, ticker=ticker)
     alt_status["시장 옵션 심리(SKEW·VVIX)"] = "사용" if macro is not None and "skew" in macro else "데이터 없음"
     alt_status["거시(VIX·금리·신용)"] = "사용" if macro is not None else "데이터 없음"
@@ -65,33 +67,33 @@ def get_direction(ticker, h, cost_bps):
         alt_status["환율·코스닥 위험선호"] = "사용" if macro is not None and "usdkrw" in macro else "데이터 없음"
         alt_status["한국은행 금리(ECOS)"] = ("키 없음" if not kr_data.get_key("ECOS_API_KEY") else
                                        "사용" if macro is not None and "kr3y" in macro else "오류")
-    return p_up, pick, now_all, contrib, asof, wf, ev, close, alt_status
+    return p_up, pick, now_all, contrib, asof, wf, close, alt_status
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def get_direction_robustness(ticker, h, cost_bps):
+def get_direction_robustness(ticker, h, cost_bps, lag):
     """방향 예측을 가정을 바꿔 다시 채점 (이미 계산된 워크포워드 예측 재사용, 재학습 없음)."""
-    res = get_direction(ticker, h, cost_bps)
-    wf, close = res[5], res[7]
-    return dr.robustness(wf, h, np.log(close).diff(), cost_bps)
+    res = get_direction(ticker, h)
+    wf, close = res[5], res[6]
+    return dr.robustness(wf, h, np.log(close).diff(), cost_bps, lag=lag)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_direction_horizons(ticker, cost_bps):
+def get_direction_horizons(ticker, cost_bps, lag):
     """예측 기간 5·10·21·42·63일로 워크포워드를 다시 돌린다 (빠른 점검용: 부스팅·앙상블 제외)."""
     close, macro, alt, _ = get_direction_inputs(ticker)
-    return dr.horizon_check(close, macro, alt, ticker, cost_bps)
+    return dr.horizon_check(close, macro, alt, ticker, cost_bps, lag=lag)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_direction_horizons_full(ticker, cost_bps):
+def get_direction_horizons_full(ticker, cost_bps, lag):
     """부스팅까지 포함한 예측 기간 점검 — 무거워서 1년마다 재학습.
 
     같은 1년 주기로 '로지스틱만' 점검도 함께 돌려, 두 결과의 차이가 부스팅 때문인지만 비교되게 한다.
     """
     close, macro, alt, _ = get_direction_inputs(ticker)
-    full = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=False, refit_every=252)
-    light = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=True, refit_every=252)
+    full = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=False, refit_every=252, lag=lag)
+    light = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=True, refit_every=252, lag=lag)
     return full, light
 
 
@@ -132,10 +134,10 @@ def get_snapshot(ticker, spot, r, q):
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def get_universe(h, cost_bps, data_stamp):
-    """data_stamp: 데이터 갱신 시각 — 새로 받으면 다시 계산되도록 캐시 키에 넣는다."""
+def get_universe(h, cost_bps, data_stamp, lag):
+    """data_stamp: 데이터 갱신 시각 — 새로 받으면 다시 계산되도록 캐시 키에 넣는다. lag: 체결 시점(거래일)."""
     panel = uv.build_panel()
-    wf = uv.walk_forward(panel, h)
+    wf = uv.walk_forward(panel, h, exec_lag=lag)
     table, curves = uv.evaluate(wf, cost_bps)
     d, pick, top, bottom = uv.current_picks(panel, wf)
     n_univ = int(panel["universe"].iloc[-1].sum())
@@ -145,7 +147,7 @@ def get_universe(h, cost_bps, data_stamp):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spread):
+def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spread, lag):
     """변동성 지수(VIX 등) − iv_gap 을 과거 ATM IV로 써서 변동성 신호를 워크포워드 검증 (최대 10년) + 현실성 점검.
 
     지수가 없으면 None.
@@ -154,7 +156,8 @@ def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spre
     if iv is None:
         return None
     close = md.load_history(ticker, 10)
-    kw = dict(vrp=vrp, threshold=threshold, cost_bps=cost_bps, r=r, q=q, iv_gap=iv_gap, option_spread=option_spread)
+    kw = dict(vrp=vrp, threshold=threshold, cost_bps=cost_bps, r=r, q=q, iv_gap=iv_gap, option_spread=option_spread,
+              lag=lag)
     bt = vol_signal_backtest(close, iv, **kw)
     if bt.empty:
         raise ValueError("과거 데이터가 너무 짧습니다 (최소 약 2년 필요)")
@@ -163,9 +166,15 @@ def get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, option_spre
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_regime(ticker, cost_bps):
+def get_regime(ticker, cost_bps, lag):
     """국면 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
-    return rg.analyze(md.load_history(ticker, 10), cost_bps)
+    return rg.analyze(md.load_history(ticker, 10), cost_bps, lag=lag)
+
+
+@st.cache_data(show_spinner=False)
+def run_var_backtest(returns):
+    """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen)."""
+    return var_backtest(np.asarray(returns))
 
 
 @st.cache_data(show_spinner=False)
@@ -216,6 +225,12 @@ with st.sidebar:
     iv_input = st.number_input("시장 기대 변동성 IV (%)", 1.0, 300.0, 20.0, 0.5, disabled=not manual_iv) / 100
     st.subheader("손익 시뮬레이션 설정")
     cost_bps = st.number_input("거래비용 (bp, 1bp = 0.01%)", 0.0, 50.0, 1.0, 0.5)
+    exec_lag = st.selectbox("백테스트 체결 시점", [1, 0], format_func={1: "다음 날 종가 (기본·보수적)",
+                                                                  0: "신호 낸 날 종가 (낙관적)"}.get,
+                            help="신호는 그날 종가까지의 데이터로 계산하므로, 같은 종가에 사고팔았다고 보면 실제로는 "
+                                 "불가능한 체결을 가정하게 됩니다. 기본값은 다음 날 종가에 체결한다고 봅니다. "
+                                 "방향 예측·시장 국면·코스피 종목 고르기·변동성 백테스트에 모두 적용됩니다.")
+    exec_word = "다음 날 종가" if exec_lag else "신호 낸 날 종가"
     n_paths = st.select_slider("시뮬레이션 횟수", [200, 500, 1000, 2000], 500)
     st.button("새로고침", on_click=st.cache_data.clear, width="stretch")
 
@@ -274,7 +289,8 @@ show_hero((f"{dir_h}일 뒤 상승 확률", "…", "방향 모델 학습 중", F
 
 try:
     with st.spinner("방향 예측 모델 학습 중…"):
-        p_up, pick, now_all, contrib, dir_asof, wf, ev, close_long, alt_status = get_direction(ticker, dir_h, cost_bps)
+        p_up, pick, now_all, contrib, dir_asof, wf, close_long, alt_status = get_direction(ticker, dir_h)
+    ev = dr.evaluate(wf, dir_h, np.log(close_long).diff(), cost_bps, lag=exec_lag)
 except Exception as e:
     p_up, ev, dir_err = None, None, e
 # 확률 정확도(Brier)가 기본 확률보다 좋고, 적중률 우위가 통계적으로 유의할 때만 '검증 통과'
@@ -294,6 +310,8 @@ with tab1:
                "최근 변동성을 바탕으로 주가가 얼마나 크게 움직일 수 있는지 보여줍니다. "
                "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 폭락·폭등이 정규분포보다 자주 나오는 점을 "
                "t분포 GARCH로 반영해 1만 번 시뮬레이션했습니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
+    if not garch.converged:
+        st.warning(garch.warnings[0] + " 범위와 VaR는 이 기본값으로 계산했으니 참고만 하세요.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
     fut_idx = pd.bdate_range(close.index[-1], periods=horizon + 1)[1:]
     sims = garch.simulate(horizon)                                  # (경로, 일) 누적 로그수익률
@@ -416,7 +434,7 @@ with tab_dir:
                        "확률 정확도 개선은 과거 상승 비율을 그대로 쓸 때보다 확률이 몇 % 더 정확한지입니다.")
 
             st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 단순 보유와 비교 "
-                        f"(거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
+                        f"(체결: {exec_word}, 거래비용 {cost_bps}bp, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
                         f"위험 대비 수익(샤프) {ev['sharpe']:.2f} vs {ev['sharpe_bh']:.2f}, "
                         f"최대 낙폭 {ev['mdd']:.0%} vs {ev['mdd_bh']:.0%})")
             eq = ev["equity"]
@@ -444,7 +462,7 @@ with tab_dir:
             st.subheader("가정을 바꿔도 결과가 같을까?")
             st.markdown("자동 선택이 보는 과거 기간, 보유 기준, 거래비용, 시기, 예측 기간을 바꿔 다시 채점합니다. "
                         "예측 기간을 빼고는 이미 계산된 예측을 다시 쓰므로 모델을 새로 학습하지 않습니다.")
-            RB = get_direction_robustness(ticker, dir_h, cost_bps)
+            RB = get_direction_robustness(ticker, dir_h, cost_bps, exec_lag)
             bw, br, bp = RB["by_window"], RB["by_rule"], RB["by_period"]
             n_pass, n_all = int(bw["검증 통과"].sum() + bp["검증 통과"].sum()), len(bw) + len(bp)
             n_beat = int((br.values > 0).sum())
@@ -477,7 +495,7 @@ with tab_dir:
             if st.button("예측 기간 바꿔 점검", key="dir_h_check"):
                 try:
                     with st.spinner("예측 기간 5가지로 다시 학습·검증하는 중… (보통 1분 안팎)"):
-                        HZ = get_direction_horizons(ticker, cost_bps)
+                        HZ = get_direction_horizons(ticker, cost_bps, exec_lag)
                     robust_table(HZ)
                     gbm_share = ev["chosen_share"].reindex(["gbm", "ensemble"]).fillna(0).sum()
                     st.caption(f"검증 통과 {int(HZ['검증 통과'].sum())} / {len(HZ)}. 빠르게 돌리려고 무거운 부스팅·앙상블 후보를 빼고 "
@@ -492,7 +510,7 @@ with tab_dir:
             if st.button("부스팅까지 포함해 점검", key="dir_h_check_full"):
                 try:
                     with st.spinner("모든 후보로 예측 기간 5가지를 다시 학습하는 중… (무료 서버에서는 몇 분 걸릴 수 있습니다)"):
-                        HF, HL = get_direction_horizons_full(ticker, cost_bps)
+                        HF, HL = get_direction_horizons_full(ticker, cost_bps, exec_lag)
                     robust_table(HF)
                     cmp = pd.DataFrame({"로지스틱만": HL["확률 정확도 개선"], "부스팅 포함": HF["확률 정확도 개선"]}).astype(float)
                     cmp["차이 (부스팅 포함 − 로지스틱만)"] = cmp["부스팅 포함"] - cmp["로지스틱만"]
@@ -539,7 +557,7 @@ with tab_pick:
             run_update()
         try:
             with st.spinner("과거 시점마다 모델을 학습·검증하는 중… (처음 1~3분)"):
-                U = get_universe(hold, pick_cost, info["updated"])
+                U = get_universe(hold, pick_cost, info["updated"], exec_lag)
         except Exception as e:
             st.error(f"계산 실패: {e}")
             U = None
@@ -573,7 +591,8 @@ with tab_pick:
             ui.chart(fig)
             st.caption(f"최대 낙폭: 상위 20% {max_drawdown(cv['auto']['상위 20% (비용 후)']):.0%} · "
                        f"전체 종목 평균 {max_drawdown(cv['_universe']):.0%}. "
-                       "리밸런싱 시점 기준이라 그 사이에 잠깐 더 빠졌던 하락은 덜 잡힙니다.")
+                       "리밸런싱 시점 기준이라 그 사이에 잠깐 더 빠졌던 하락은 덜 잡힙니다. "
+                       f"종목을 고른 날의 데이터로 순위를 매기고 {exec_word}에 사고판다고 봤습니다.")
 
             st.markdown("**모델 비교** — 모두 같은 조건으로 시험했습니다. 이 표를 보고 나중에 1등을 고르면 성적이 부풀려지므로, "
                         "앱은 매 시점 그때까지의 성적만 보고 고른 **자동 선택**을 씁니다.")
@@ -749,6 +768,8 @@ with tab2:
     d.metric("반감기", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
     e.metric("꼬리 두께 (ν)", f"{garch.nu:.1f}",
              help="충격 분포(t분포)의 자유도. 작을수록 폭락·폭등이 자주 나옵니다. 정규분포는 ∞, 주식은 보통 4~10")
+    for msg in garch.warnings:
+        (st.warning if not garch.converged else st.caption)(msg)
 
 # ---------------- 시장 국면 ----------------
 with tab_regime:
@@ -757,7 +778,7 @@ with tab_regime:
                "확률은 그날까지의 데이터만으로 계산해서, 과거 구간에도 미래 정보가 섞이지 않습니다.")
     try:
         with st.spinner("국면 모델 추정 중…"):
-            R = get_regime(ticker, cost_bps)
+            R = get_regime(ticker, cost_bps, exec_lag)
     except Exception as e:
         R = None
         st.error(f"국면 분석을 할 수 없습니다 (데이터 부족 등): {e}")
@@ -803,7 +824,7 @@ with tab_regime:
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                           yaxis_title="누적 (시작=1)", legend=dict(orientation="h", y=1.1))
         ui.chart(fig)
-        st.caption("확률이 50% 이상인 날 종가에 팔고 다음 날부터 현금(이자 0으로 계산), 50% 아래로 내려오면 다시 삽니다. "
+        st.caption(f"확률이 50% 이상이 되면 {exec_word}에 팔고 현금(이자 0으로 계산), 50% 아래로 내려오면 다시 삽니다. "
                    "국면 분류는 보통 수익을 늘리기보다 큰 하락을 줄이는 도구입니다. 상승장 초입을 놓치는 대가가 따릅니다.")
 
 # ---------------- 3. 옵션 가격 & 헤지 손익 ----------------
@@ -870,8 +891,9 @@ with tab3:
     else:
         vix_name = vix_sym.lstrip("^")
         st.markdown(f"과거 {vix_name}(30일 만기 옵션에 담긴 시장 기대 변동성)에서 아래 차이를 뺀 값을 그날의 ATM IV로 보고, "
-                    "한 달(21거래일)마다 그때까지의 데이터로만 GARCH 예측 → 신호 → ATM 스트래들 진입 → 매일 델타헤지 → 만기 정산을 "
-                    "반복합니다. 사이드바의 VRP·관망 구간·거래비용(주식 헤지)을 그대로 씁니다.")
+                    "한 달(21거래일)마다 그때까지의 데이터로만 GARCH 예측 → 신호 → ATM 스트래들 진입 → 그날그날의 IV로 매일 "
+                    f"델타헤지 → 만기 정산을 반복합니다. 진입은 {exec_word}(사이드바 '백테스트 체결 시점')이고, "
+                    "사이드바의 VRP·관망 구간·거래비용(주식 헤지)을 그대로 씁니다.")
         o1, o2 = st.columns(2)
         iv_gap = o1.number_input(f"{vix_name}와 실제 ATM IV의 차이 (%p)", 0.0, 5.0, 2.0, 0.5,
                                  help=f"{vix_name}는 외가격 옵션까지 섞어 계산해서 ATM 옵션 IV보다 보통 1~3%p 높습니다. "
@@ -882,7 +904,7 @@ with tab3:
         if st.button("과거 성적 계산", type="primary", key="vol_bt"):
             try:
                 with st.spinner("최대 10년치를 한 달씩 다시 예측하고, 차이·진입일을 바꿔 가며 점검하는 중…"):
-                    res = get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, opt_spread)
+                    res = get_vol_backtest(ticker, vrp, threshold, cost_bps, r, q, iv_gap, opt_spread, exec_lag)
             except Exception as e:
                 res = "error"
                 st.error(f"계산 실패: {e}")
@@ -1040,7 +1062,7 @@ with tab4:
                       f"모델이 {'더 정확' if rmse('garch') < rmse('naive') else '덜 정확'}", delta_color="off")
             m3.metric("68% 범위 안에 든 비율", f"{bt['in1'].mean():.0%}", "목표 68%", delta_color="off")
             m4.metric("95% 범위 안에 든 비율", f"{bt['in2'].mean():.0%}", "목표 95%", delta_color="off")
-            m5.metric("VaR 95%를 넘은 손실", f"{bt['var_breach'].mean():.0%}", "목표 5%", delta_color="off")
+            m5.metric("VaR 95%를 넘은 손실", f"{bt['var_breach'].mean():.0%}", f"목표 5% · {horizon}일 겹침", delta_color="off")
             dates = rets.index[bt["origin"]]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=dates, y=bt["realized"], name="실제 변동성", line=dict(color=ui.INK)))
@@ -1050,6 +1072,16 @@ with tab4:
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
             st.caption(f"10거래일 간격으로 {len(bt)}번 검증했습니다. 검증 기간이 서로 겹쳐 있어 결과를 너무 믿지는 마세요.")
+
+            st.markdown("**하루 VaR 예외 검정** — 매일 다음 날의 VaR를 내고(21거래일마다 다시 적합), 실제 손실이 그보다 컸던 날을 셉니다")
+            vt = run_var_backtest(rets.values)
+            vshow = vt.assign(판정=np.where(vt["종합 p값"].astype(float) > 0.05, "통과", "기각"))
+            st.dataframe(vshow.style.format({"관측일": "{:.0f}", "예외 횟수": "{:.0f}", "예외 비율": "{:.1%}", "목표 비율": "{:.0%}",
+                                             "Kupiec p값": "{:.2f}", "Christoffersen p값": "{:.2f}", "종합 p값": "{:.2f}"}),
+                         width="stretch", column_config={"판정": st.column_config.TextColumn("판정", alignment="center")})
+            st.caption("Kupiec: 예외 비율이 목표(5%·1%)와 같은지. Christoffersen: 예외가 특정 시기에 몰려 나오지 않는지 "
+                       "(몰리면 변동성 변화를 늦게 따라간다는 뜻). p값이 0.05보다 작으면 그 VaR를 기각합니다. "
+                       "하루 단위라 위의 기간 VaR와 달리 표본이 겹치지 않습니다.")
 
 ui.footer("교육·연구용 고지:", "이 프로그램의 예측과 신호는 과거 데이터로 계산한 참고 자료이며 투자 조언이 아닙니다. "
           "과거 검증 결과가 미래 성과를 보장하지 않습니다.",

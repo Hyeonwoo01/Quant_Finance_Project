@@ -78,6 +78,27 @@ for col in ("auto", "base", "logit_price", "gbm", "ensemble"):     # 자동 선�
     assert np.allclose(wf_a[col][upto], wf_b[col][upto]), col
 ev = dr.evaluate(wf_a, 21, np.log(px).diff())
 assert 0 <= ev["hit"] <= 1 and len(ev["equity"]) == len(wf_a)
+# 체결 시점: lag=1(기본)이면 t일 판단 → t+1일 종가 체결 → t+2일 수익률부터, lag=0이면 t+1일 수익률부터
+_r = np.log(px).diff()
+_pos = (wf_a["auto"] > 0.5).astype(float)
+for _lag in (0, 1):
+    _e = dr.evaluate(wf_a, 21, _r, lag=_lag)
+    assert np.allclose(np.diff(np.log(_e["equity"]["전략"].values)),
+                       (_pos * _r.shift(-(1 + _lag)).reindex(wf_a.index).fillna(0.0)).values[1:])
+    assert _e["z"] == ev["z"] and _e["skill"] == ev["skill"]          # 예측 채점은 체결 시점과 무관
+
+# 겹침 보정 t값: 겹침이 없으면(h=1) 보통 t값과 같고, 21일씩 겹친 합이면 크게 줄어야 한다
+from quant_engine import overlap_tstat
+_g = np.random.default_rng(3)
+_iid = _g.standard_normal(5000) + 0.05
+assert abs(overlap_tstat(_iid, 1) - _iid.mean() / _iid.std() * np.sqrt(5000)) < 1e-9
+_ov = np.convolve(_g.standard_normal(5020) + 0.05, np.ones(21), "valid")
+assert abs(overlap_tstat(_ov, 21)) < abs(_ov.mean() / _ov.std() * np.sqrt(len(_ov))) / 2
+assert overlap_tstat(np.zeros(100), 5) == 0.0
+# 효과가 없을 때 '우연인데 유의(|t| > 1.96)' 비율이 목표 5% 근처여야 한다 (Newey-West 시차 20이면 약 11%)
+_rej = np.mean([abs(overlap_tstat(np.convolve(_g.standard_normal(2520), np.ones(21), "valid")[:2500], 21)) > 1.96
+                for _ in range(1000)])
+assert 0.025 < _rej < 0.08, _rej
 
 # 파이프라인이 '실제로 예측 가능한' 데이터에선 신호를 찾아내는지 (모멘텀이 있는 합성 가격)
 r = np.zeros(2500)
@@ -196,6 +217,13 @@ for m in ("ridge", "composite", "auto"):
     sa, sb = wf_u["scores"][m], wf_b["scores"][m]
     rows = sa.index[sa.index <= cut]
     assert len(rows) > 5 and np.allclose(sa.loc[rows].values, sb.loc[rows].values, equal_nan=True), m
+# 체결 시점: 채점 수익률은 '다음 날 종가부터 h일'(기본), exec_lag=0이면 '그날 종가부터'. 점수(판단)는 같아야 한다
+wf_u0 = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",), exec_lag=0)
+_cl, _d0 = pa["close"], wf_u["rebal"][3]
+_i0 = _cl.index.get_loc(_d0)
+assert np.allclose(wf_u0["fwd"].loc[_d0], np.log(_cl.iloc[_i0 + 21] / _cl.iloc[_i0]))
+assert np.allclose(wf_u["fwd"].loc[_d0], np.log(_cl.iloc[_i0 + 22] / _cl.iloc[_i0 + 1]))
+assert wf_u["exec_lag"] == 1 and np.allclose(wf_u["scores"]["ridge"].values, wf_u0["scores"]["ridge"].values, equal_nan=True)
 
 # 거시 지표 시차: 명시 > 티커로 자동 판단 > 모르면 안전하게 하루 늦춤
 assert dr.resolve_lag(None, "005930.KS") and dr.resolve_lag(None, "247540.KQ")
@@ -275,6 +303,36 @@ z1 = gn_.simulate(1, 200000, seed=2)[:, 0]
 assert abs(np.quantile(z1, 0.01) / np.sqrt(gn_.sigma2_next) + 2.326) < 0.03                  # 정규면 1% 분위수 = −2.326σ
 assert np.quantile(gt.simulate(1, 200000, seed=2)[:, 0], 0.001) / np.sqrt(gt.sigma2_next) < -3.3   # t는 꼬리가 더 두껍다
 
+# GARCH 추정 실패: 최적화가 실패하면 조용히 쓰지 않고 기본값으로 대체 + 경고
+import quant_engine as qe
+from types import SimpleNamespace
+_orig_min = qe.minimize
+qe.minimize = lambda *a, **k: SimpleNamespace(success=False, x=np.full(4, np.nan), fun=np.nan)
+try:
+    gf = GarchVolForecaster().fit(simulate_garch(1000, 4e-6, 0.08, 0.90, np.random.default_rng(3)))
+finally:
+    qe.minimize = _orig_min
+assert not gf.converged and gf.warnings and abs(gf.persistence - 0.95) < 1e-12 and gf.nu == 8.0
+assert np.isfinite(gf.forecast_vol(21)) and np.isfinite(gf.simulate(5, 100)).all()
+assert gt.converged and not GarchVolForecaster().fit(np.zeros(10)).converged          # 표본이 너무 적으면 바로 기본값
+
+# VaR 예외 검정: Kupiec 공식, 몰려 나온 예외는 Christoffersen이 잡고, 예외가 0개(너무 보수적)여도 기각
+from scipy.stats import chi2
+from quant_engine import var_backtest, var_exception_tests
+_h = np.zeros(250, bool)
+_h[np.random.default_rng(0).choice(250, 13, replace=False)] = True
+_k = var_exception_tests(_h, 0.05)
+_pi = 13 / 250
+_lr = -2 * ((237 * np.log(0.95) + 13 * np.log(0.05)) - (237 * np.log(1 - _pi) + 13 * np.log(_pi)))
+assert _k["예외 횟수"] == 13 and abs(_k["Kupiec p값"] - chi2.sf(_lr, 1)) < 1e-12
+_cl_h = np.zeros(250, bool)
+_cl_h[100:113] = True
+assert var_exception_tests(_cl_h, 0.05)["Christoffersen p값"] < 0.01 and abs(var_exception_tests(_cl_h, 0.05)["Kupiec p값"] - _k["Kupiec p값"]) < 1e-12
+assert var_exception_tests(np.zeros(250, bool), 0.05)["Kupiec p값"] < 0.01
+_vt = var_backtest(simulate_garch_t(1500, 4e-6, 0.08, 0.90, 5.0, np.random.default_rng(12)))
+assert list(_vt.index) == ["하루 VaR 95%", "하루 VaR 99%"] and _vt.loc["하루 VaR 95%", "관측일"] == 500
+assert 0.02 < _vt.loc["하루 VaR 95%", "예외 비율"] < 0.09
+
 v95, es95 = var_es(np.random.default_rng(0).normal(0, 0.01, 400000), 0.95)
 assert abs(v95 - (1 - np.exp(-1.645 * 0.01))) < 3e-4 and es95 > v95
 assert max_drawdown([1.0, 1.2, 0.9, 1.3, 1.17]) == -0.25 and max_drawdown([1, 2, 3]) == 0.0
@@ -293,6 +351,8 @@ _T, _S = _rng.uniform(25, 35, 6) / 365, _rng.uniform(0.1, 0.5, 6)
 for c in (0.0, 3.0):
     _one = [GammaScalpingEngine(p[0], p[0], t, 0.02, sg, 0.01).hedged_pnl(p, 1, c) for p, t, sg in zip(_P, _T, _S)]
     assert np.allclose(hedged_straddle_pnl(_P, _T, 0.02, _S, 0.01, c), _one)
+assert np.allclose(hedged_straddle_pnl(_P, _T, 0.02, _S, 0.01, 3.0, np.repeat(_S[:, None], _P.shape[1], axis=1)),
+                   hedged_straddle_pnl(_P, _T, 0.02, _S, 0.01, 3.0))          # 매일 IV가 같으면 예전 방식과 동일
 assert np.allclose(straddle_price(_P[:, 0], _P[:, 0], _T, 0.02, _S, 0.01),
                    [GammaScalpingEngine(p[0], p[0], t, 0.02, sg, 0.01).straddle_greeks()["price"] for p, t, sg in zip(_P, _T, _S)])
 
@@ -308,7 +368,7 @@ assert vtab.loc["long", "평균 손익(주가 대비)"] < 0 and len(vcur) == len
 _px2 = _px.copy()
 _px2.iloc[1000:] *= np.exp(np.cumsum(0.05 * _rng.standard_normal(400)))      # T=1000 이후 가격만 바꿈
 vb2 = vol_signal_backtest(_px2, _iv, vrp=0.0, threshold=0.02, h=21, cost_bps=1.0)
-done = [d for i, d in enumerate(vb.index) if _idx.get_loc(d) + 21 < 1000]      # 결과까지 T 이전에 끝난 거래
+done = [d for i, d in enumerate(vb.index) if _idx.get_loc(d) + 1 + 21 < 1000]  # 다음 날 진입 → 만기까지 T 이전
 assert len(done) > 10 and np.allclose(vb.loc[done].values, vb2.loc[done].values)
 
 # 현실성 옵션: 옵션 체결 비용 = 비율 × 스트래들 가격, IV를 낮추면 매도 이익이 줄어듦, GARCH 예측 재사용, 진입일 늦추기
@@ -361,6 +421,13 @@ _bs2.iloc[_half:, _bs2.columns.get_loc("long")] *= -1                # 뒤 기�
 assert short_only_split(add_combined_forecast(_bs2), iv_name="VIX")["chosen"] == so["chosen"]
 assert short_only_split(add_combined_forecast(_bs.iloc[:40]), iv_name="VIX") is None   # 표본 부족
 
+# 체결 시점: 기본은 판단 다음 날 종가·그날 IV로 진입, lag=0이면 판단한 날 그대로
+_ivw = pd.Series(0.2 + 0.1 * np.sin(np.arange(1400) / 30), index=_idx)
+_l1 = vol_signal_backtest(_px, _ivw)
+_l0 = vol_signal_backtest(_px, _ivw, lag=0, daily_iv_hedge=False)
+assert np.allclose(_l1["iv_entry"].values, _ivw.shift(-1).reindex(_l1.index).values) and np.allclose(_l1["iv"], _ivw.reindex(_l1.index))
+assert np.allclose(_l0["iv_entry"], _l0["iv"]) and (_l1.index == _l0.index[:len(_l1)]).all()
+
 # '매도만' 견고성: 모든 조합에서 통하는 데이터면 고정 규칙이 늘 항상 매도보다 낫고, 뒤 기간을 뒤집으면 못해야 한다
 from quant_engine import short_only_robustness
 rob = short_only_robustness({(0.0, 0): _bs, (0.01, 0): _bs, (0.0, 4): _bs.iloc[2:]}, rule=so["chosen"], iv_name="VIX")
@@ -390,6 +457,8 @@ _c2.iloc[2100:] = _c.iloc[2100] * np.exp(np.cumsum(_x2[2100:]))
 pa, _ = rg.walk_forward(_c)
 pb, _ = rg.walk_forward(_c2)
 assert pa.iloc[:756].isna().all() and np.allclose(pa.iloc[756:2099], pb.iloc[756:2099])
+_rr = np.log(_c).diff().dropna()
+assert not np.allclose(rg.evaluate(pa, _rr, lag=0)["equity"].values, rg.evaluate(pa, _rr, lag=1)["equity"].values)
 out = rg.analyze(_c, 1.0)
 assert out["table"].loc["불안 국면엔 현금", "최대 낙폭"] > out["table"].loc["단순 보유", "최대 낙폭"]   # 심어 둔 국면이면 낙폭이 줄어야
 print("모든 테스트 통과")

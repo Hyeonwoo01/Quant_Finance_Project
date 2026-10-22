@@ -106,11 +106,14 @@ def walk_forward(close, refit_every=252, min_train=756):
     return pd.Series(p_high, index=r.index, name="p_high"), r
 
 
-def evaluate(p_high, r, cost_bps=0.0, threshold=0.5):
-    """'불안 국면 확률이 threshold 이상이면 현금, 아니면 보유' vs 단순 보유 (t일 종가에 결정 → t+1일 수익률)."""
+def evaluate(p_high, r, cost_bps=0.0, threshold=0.5, lag=1):
+    """'불안 국면 확률이 threshold 이상이면 현금, 아니면 보유' vs 단순 보유.
+
+    t일 종가까지 보고 판단 → lag 거래일 뒤 종가에 체결 (1 = 다음 날 종가, 기본 / 0 = 판단한 그 종가, 낙관적).
+    """
     known = p_high.notna()
     pos = (p_high[known] < threshold).astype(float)
-    nxt = r.shift(-1).reindex(pos.index).fillna(0.0)
+    nxt = r.shift(-(1 + lag)).reindex(pos.index).fillna(0.0)
     turnover = pos.diff().abs().fillna(pos.iloc[0])
     strat = pos * nxt - turnover * cost_bps * 1e-4
     equity = pd.DataFrame({"불안 국면엔 현금": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())})
@@ -126,7 +129,7 @@ def evaluate(p_high, r, cost_bps=0.0, threshold=0.5):
             "switches": int(turnover.iloc[1:].sum())}
 
 
-def analyze(close, cost_bps=0.0):
+def analyze(close, cost_bps=0.0, lag=1):
     """앱용 묶음: 워크포워드 확률·전략 성적 + 전체 기간으로 추정한 현재 모델."""
     p_high, r = walk_forward(close)
     if p_high.notna().sum() < 63:
@@ -135,4 +138,4 @@ def analyze(close, cost_bps=0.0):
     p_now = now.filter(r.values)
     return {"p_high": p_high, "close": close, "p_now": float(p_now[-1]), "asof": r.index[-1], "states": now.describe(),
             "stay": np.diag(now.P), "in_sample_share": float((p_now >= 0.5).mean()),
-            **evaluate(p_high, r, cost_bps)}
+            **evaluate(p_high, r, cost_bps, lag=lag)}
