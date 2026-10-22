@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 
 import alt_data
 import market_data
-from quant_engine import max_drawdown
+from quant_engine import max_drawdown, newey_west_tstat
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
@@ -287,9 +287,12 @@ def score(prob, fwd, h):
     known = fwd.notna() & prob.notna()
     p, up = prob[known].values, (fwd[known].values > 0).astype(float)
     base = float(up.mean())
-    hit = float(np.mean((p > 0.5) == up))
-    n_eff = max(len(p) / h, 1.0)                     # h일 수익률이 겹치므로 실질 독립 표본 수
-    z = (hit - base) / np.sqrt(max(base * (1 - base), 1e-9) / n_eff)
+    correct = ((p > 0.5) == up).astype(float)
+    hit = float(correct.mean())
+    n_eff = max(len(p) / h, 1.0)                     # h일 수익률이 겹치므로 실질 독립 표본 수 (대략)
+    # z: 날마다 (모델 적중 − '항상 오른다' 적중)의 평균이 0보다 큰가. h일 라벨이 겹쳐 서로 상관되므로
+    # Newey-West(HAC) 표준오차를 쓴다 (lag = h − 1). 모델이 늘 '오른다'고 하면 차이가 0이라 z = 0.
+    z = newey_west_tstat(correct - up, h - 1)
     brier = float(np.mean((p - up) ** 2))
     brier_base = float(np.mean((base - up) ** 2))
     try:
@@ -300,13 +303,17 @@ def score(prob, fwd, h):
             "skill": 1 - brier / brier_base if brier_base > 0 else 0.0, "n": int(len(p)), "n_eff": n_eff}
 
 
-def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5):
-    """모든 후보와 자동 선택을 채점 + 자동 선택의 '상승 확률 > threshold면 보유' 전략 vs 단순 보유."""
+def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1):
+    """모든 후보와 자동 선택을 채점 + 자동 선택의 '상승 확률 > threshold면 보유' 전략 vs 단순 보유.
+
+    lag: t일 종가까지 보고 판단한 뒤 실제로 사고파는 시점까지의 거래일 수.
+         1(기본) = 다음 날 종가에 체결 → t+1일 종가부터의 수익률을 얻음. 0 = 판단한 그 종가에 체결(낙관적).
+    """
     cols = [c for c in MODEL_LABELS if c in wf] + ["auto"]
     table = {c: score(wf[c], wf["fwd"], h) for c in cols}
 
     pos = (wf["auto"] > threshold).astype(float)
-    nxt = daily_returns.shift(-1).reindex(wf.index).fillna(0.0)    # t일 종가에 결정 → t+1일 수익률
+    nxt = daily_returns.shift(-(1 + lag)).reindex(wf.index).fillna(0.0)    # t일 판단 → t+lag일 종가 체결 이후 수익률
     turnover = pos.diff().abs().fillna(pos.iloc[0])
     strat = pos * nxt - turnover * cost_bps * 1e-4
     equity = pd.DataFrame({"전략": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())}, index=wf.index)
@@ -348,7 +355,7 @@ def _robust_row(ev):
 
 
 def robustness(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260),
-               thresholds=(0.45, 0.5, 0.55), costs=(1.0, 5.0, 10.0, 20.0), n_periods=3):
+               thresholds=(0.45, 0.5, 0.55), costs=(1.0, 5.0, 10.0, 20.0), n_periods=3, lag=1):
     """방향 예측을 가정을 바꿔 다시 채점한다 (모두 이미 계산된 워크포워드 예측을 재사용, 재학습 없음).
 
     by_window: 자동 선택이 보는 과거 성적 기간(1·2·3·5년)을 바꿔 다시 고르기.
@@ -358,26 +365,27 @@ def robustness(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260)
     by_window = {}
     for w in windows:
         rw = reselect(wf, h, w)
-        row = _robust_row(evaluate(rw, h, daily_returns, cost_bps))
+        row = _robust_row(evaluate(rw, h, daily_returns, cost_bps, lag=lag))
         top = rw["chosen"].value_counts(normalize=True)
         row["가장 많이 고른 모델"] = f"{MODEL_LABELS[top.index[0]]} {top.iloc[0]:.0%}"
         by_window[f"최근 {w // 252}년"] = row
     rule = {}
     for th in thresholds:
         for c in costs:
-            ev = evaluate(wf, h, daily_returns, c, threshold=th)
+            ev = evaluate(wf, h, daily_returns, c, threshold=th, lag=lag)
             rule[(f"{th:.0%}", f"{c:g}bp")] = ev["sharpe"] - ev["sharpe_bh"]
     by_rule = pd.Series(rule).unstack()[[f"{c:g}bp" for c in costs]]
     by_rule.index.name, by_rule.columns.name = "보유 기준", "거래비용"
     by_period = {}
     for part in np.array_split(np.arange(len(wf)), n_periods):
         sub = wf.iloc[part]
-        by_period[f"{sub.index[0].date()} ~ {sub.index[-1].date()}"] = _robust_row(evaluate(sub, h, daily_returns, cost_bps))
+        by_period[f"{sub.index[0].date()} ~ {sub.index[-1].date()}"] = _robust_row(evaluate(sub, h, daily_returns, cost_bps,
+                                                                                      lag=lag))
     return {"by_window": pd.DataFrame(by_window).T, "by_rule": by_rule, "by_period": pd.DataFrame(by_period).T}
 
 
 def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizons=(5, 10, 21, 42, 63),
-                  refit_every=21, light=True):
+                  refit_every=21, light=True, lag=1):
     """예측 기간을 바꿔 워크포워드를 처음부터 다시 돌린다.
 
     light=True(기본): 무거운 부스팅·앙상블을 빼고 기본 확률·로지스틱 후보만 — 무료 서버에서도 1분 안팎.
@@ -389,7 +397,7 @@ def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizo
         wf, _ = walk_forward(close, h, macro, alt=alt, ticker=ticker, refit_every=refit_every, light=light)
         if wf.empty:
             continue
-        rows[f"{h}거래일"] = _robust_row(evaluate(wf, h, r, cost_bps))
+        rows[f"{h}거래일"] = _robust_row(evaluate(wf, h, r, cost_bps, lag=lag))
         if not light:          # 부스팅이 실제로 골라졌는지 — 0%면 부스팅을 넣어도 결과가 같다
             rows[f"{h}거래일"]["부스팅·앙상블 선택 비율"] = float(wf["chosen"].isin(["gbm", "ensemble"]).mean())
     return pd.DataFrame(rows).T

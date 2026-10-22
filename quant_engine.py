@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import brentq, minimize
 from scipy.signal import lfilter
-from scipy.special import gammaln
-from scipy.stats import norm
+from scipy.special import gammaln, xlogy
+from scipy.stats import chi2, norm
+from scipy.stats import t as student_t
 
 
 class RiskNeutralPricingEngine:
@@ -106,12 +107,21 @@ class GarchVolForecaster:
         self.trading_days, self.dist = trading_days, dist
         self.omega = self.alpha = self.beta = self.sigma2_next = None
         self.nu = np.inf
+        self.mu = 0.0            # 적합 구간 평균 일간 수익률 (분산 갱신 시 빼는 값)
         self.cond_vol = None     # 적합 구간의 조건부 변동성(연율) — 차트용
+        self.converged = True    # 최적화가 실패해 기본값으로 대체했으면 False
+        self.warnings = []       # 경계값에 닿은 추정 등 사용자에게 알릴 내용
+
+    # 최적화가 실패했을 때 쓰는 보수적인 기본값 (주식 일간 수익률에서 흔한 수준, 장기 분산 = 표본 분산)
+    FALLBACK = {"alpha": 0.05, "beta": 0.90, "nu": 8.0}
 
     def fit(self, daily_log_returns):
         r = np.asarray(daily_log_returns, float)
-        x = (r - r.mean()) * 100.0          # 수치 안정성을 위해 % 단위로 스케일
+        r = r[np.isfinite(r)]
+        self.mu = float(r.mean()) if len(r) else 0.0
+        x = (r - self.mu) * 100.0          # 수치 안정성을 위해 % 단위로 스케일
         n, var0 = len(x), x.var()
+        self.converged, self.warnings = True, []
 
         def cond_var(p):
             omega, alpha, beta = p
@@ -128,15 +138,40 @@ class GarchVolForecaster:
             const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * (nu - 2))
             return np.sum(0.5 * np.log(s2) + (nu + 1) / 2 * np.log1p(x**2 / ((nu - 2) * s2))) - n * const
 
-        x0 = [0.05 * var0, 0.05, 0.90]
-        bounds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)]
-        if self.dist == "t":
-            x0, bounds = x0 + [8.0], bounds + [(2.1, 200.0)]
-        res = minimize(nll, x0=x0, method='SLSQP', bounds=bounds,
-                       constraints=[{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2]}])
-        omega, alpha, beta = res.x[:3]
-        self.nu = float(res.x[3]) if self.dist == "t" else np.inf
-        s2 = cond_var(res.x[:3])
+        bounds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)] + ([(2.1, 200.0)] if self.dist == "t" else [])
+        cons = [{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2]}]
+        # 첫 시작값으로 성공하면 그대로 쓰고(대부분), 실패하면 다른 시작값으로 차례로 다시 시도한다
+        starts = [[0.05 * var0, 0.05, 0.90, 8.0], [0.10 * var0, 0.10, 0.80, 5.0], [0.02 * var0, 0.03, 0.95, 12.0]]
+        best = None
+        if n >= 30 and var0 > 0:
+            for x0 in starts:
+                with np.errstate(all="ignore"):
+                    res = minimize(nll, x0=x0[:len(bounds)], method='SLSQP', bounds=bounds, constraints=cons)
+                ok = (res.success and np.all(np.isfinite(res.x)) and np.isfinite(res.fun)
+                      and res.x[1] + res.x[2] < 1.0)
+                if ok and (best is None or res.fun < best.fun):
+                    best = res
+                if best is not None:
+                    break
+        if best is None:                    # 추정 실패 → 기본값으로 대체하고 알린다 (조용히 틀린 값을 쓰지 않음)
+            fb = self.FALLBACK
+            a, b = fb["alpha"], fb["beta"]
+            params = [max(var0, 1e-8) * (1 - a - b), a, b]
+            self.nu = fb["nu"] if self.dist == "t" else np.inf
+            self.converged = False
+            self.warnings.append(f"GARCH 추정이 수렴하지 않아 기본값(α={a}, β={b}, 장기 분산 = 표본 분산)으로 대체했습니다.")
+        else:
+            params = list(best.x[:3])
+            self.nu = float(best.x[3]) if self.dist == "t" else np.inf
+            if params[1] + params[2] > 0.995:
+                self.warnings.append("α+β가 1에 매우 가깝게 추정됐습니다 — 변동성 충격이 거의 사라지지 않는다는 뜻이라 "
+                                     "장기 예측이 불안정할 수 있습니다.")
+            if self.dist == "t" and self.nu >= 199.0:
+                self.warnings.append("꼬리 두께 ν가 상한(200)에 닿았습니다 — 정규분포와 거의 같다는 뜻입니다.")
+            if self.dist == "t" and self.nu <= 2.11:
+                self.warnings.append("꼬리 두께 ν가 하한(2.1)에 닿았습니다 — 극단값에 끌려간 추정일 수 있습니다.")
+        omega, alpha, beta = params
+        s2 = cond_var(params)
         self.omega, self.alpha, self.beta = omega / 1e4, alpha, beta
         self.sigma2_next = (omega + alpha * x[-1] ** 2 + beta * s2[-1]) / 1e4
         self.cond_vol = np.sqrt(s2 / 1e4 * self.trading_days)
@@ -263,25 +298,96 @@ def straddle_price(S, K, T, r, sigma, q=0.0):
     return fs * (norm.cdf(d1) - norm.cdf(-d1)) - dk * (norm.cdf(d2) - norm.cdf(-d2))
 
 
-def hedged_straddle_pnl(paths, T, r, sigma, q=0.0, cost_bps=0.0):
+def hedged_straddle_pnl(paths, T, r, sigma, q=0.0, cost_bps=0.0, sigma_path=None):
     """롱 ATM 스트래들을 매일 델타헤지했을 때의 만기 손익 — 행마다 만기(T)·IV(sigma)가 다른 여러 진입을 한 번에.
 
     GammaScalpingEngine.hedged_pnl(position=+1)과 같은 계산이다 (행사가 = 각 경로의 첫 가격).
     paths: (진입 수, n+1), T·sigma: (진입 수,).
+    sigma_path: (진입 수, n+1) — 주면 매일 그날의 IV로 델타를 다시 계산한다 (진입 가격은 sigma).
+                없으면 진입 IV 하나로 끝까지 헤지 (예전 방식).
     """
     S = np.asarray(paths, float)
     T, sg = np.asarray(T, float), np.asarray(sigma, float)
+    sp = None if sigma_path is None else np.asarray(sigma_path, float)
     n, K, dt, cost = S.shape[1] - 1, S[:, 0], T / (S.shape[1] - 1), cost_bps * 1e-4
     shares = -_straddle_delta(S[:, 0], K, T, r, sg, q)
     cash = -straddle_price(S[:, 0], K, T, r, sg, q) - shares * S[:, 0] - cost * np.abs(shares) * S[:, 0]
     for t in range(1, n + 1):
         cash = cash * np.exp(r * dt) + shares * S[:, t - 1] * q * dt
         if t < n:
-            new = -_straddle_delta(S[:, t], K, T - t * dt, r, sg, q)
+            new = -_straddle_delta(S[:, t], K, T - t * dt, r, sg if sp is None else sp[:, t], q)
             trade = new - shares
             cash -= trade * S[:, t] + cost * np.abs(trade) * S[:, t]
             shares = new
     return cash + shares * S[:, n] + np.abs(S[:, n] - K)
+
+
+def newey_west_tstat(x, lags):
+    """평균이 0인지 검정하는 t값 (Newey-West HAC 표준오차, Bartlett 가중).
+
+    h일 수익률처럼 하루하루 겹치는 표본은 서로 상관돼 있어 보통 표준오차가 너무 작게 나온다 → lags = h − 1.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 2:
+        return 0.0
+    e = x - x.mean()
+    s = e @ e / n
+    for lag in range(1, min(int(lags), n - 1) + 1):
+        s += 2 * (1 - lag / (lags + 1)) * (e[lag:] @ e[:-lag]) / n
+    se = np.sqrt(max(s, 0.0) / n)
+    return float(x.mean() / se) if se > 1e-15 else 0.0
+
+
+def _std_quantile(p, nu):
+    """분산이 1이 되도록 표준화한 충격 분포의 p 분위수 (t분포 또는 정규)."""
+    return float(student_t.ppf(p, nu) * np.sqrt((nu - 2) / nu)) if np.isfinite(nu) else float(norm.ppf(p))
+
+
+def var_exception_tests(hits, p):
+    """VaR 예외(손실이 VaR를 넘은 날) 검정.
+
+    Kupiec: 예외 비율이 목표(p)와 같은가. Christoffersen: 예외가 몰려서 나오지 않는가(전날 예외 여부와 독립인가).
+    종합(조건부 커버리지) = 두 통계량의 합, 자유도 2. p값이 0.05보다 작으면 그 VaR 모델을 기각한다.
+    """
+    hits = np.asarray(hits, bool)
+    n, x = len(hits), int(hits.sum())
+    pi = x / n if n else 0.0
+    lr_pof = -2 * (xlogy(n - x, 1 - p) + xlogy(x, p) - xlogy(n - x, 1 - pi) - xlogy(x, pi))
+    a, b = hits[:-1], hits[1:]
+    n00, n01 = int(np.sum(~a & ~b)), int(np.sum(~a & b))
+    n10, n11 = int(np.sum(a & ~b)), int(np.sum(a & b))
+    p0 = n01 / (n00 + n01) if n00 + n01 else 0.0
+    p1 = n11 / (n10 + n11) if n10 + n11 else 0.0
+    pa = (n01 + n11) / (n00 + n01 + n10 + n11) if n > 1 else 0.0
+    lr_ind = -2 * (xlogy(n00 + n10, 1 - pa) + xlogy(n01 + n11, pa)
+                   - xlogy(n00, 1 - p0) - xlogy(n01, p0) - xlogy(n10, 1 - p1) - xlogy(n11, p1))
+    lr_pof, lr_ind = max(float(lr_pof), 0.0), max(float(lr_ind), 0.0)
+    return {"관측일": n, "예외 횟수": x, "예외 비율": pi, "목표 비율": p,
+            "Kupiec p값": float(chi2.sf(lr_pof, 1)), "Christoffersen p값": float(chi2.sf(lr_ind, 1)),
+            "종합 p값": float(chi2.sf(lr_pof + lr_ind, 2))}
+
+
+def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t"):
+    """하루 VaR 워크포워드 검증: refit_every일마다 그때까지의 수익률로 GARCH를 다시 적합하고,
+    그 사이에는 실제 수익률로 조건부 분산만 갱신하며 매일 다음 날 VaR를 낸다 (앱 화면의 VaR와 같은 평균 0 가정).
+    겹치지 않는 하루 단위라 Kupiec·Christoffersen 검정을 그대로 쓸 수 있다.
+    """
+    r = np.asarray(returns, float)
+    n = len(r)
+    start = max(250, n - 500) if start is None else start
+    hits = {lv: [] for lv in levels}
+    for b in range(start, n, refit_every):
+        g = GarchVolForecaster(dist=dist).fit(r[max(0, b - window):b])
+        zq = {lv: _std_quantile(1 - lv, g.nu) for lv in levels}
+        s2 = g.sigma2_next
+        for t in range(b, min(b + refit_every, n)):
+            for lv in levels:
+                hits[lv].append(r[t] < zq[lv] * np.sqrt(s2))
+            s2 = g.omega + g.alpha * (r[t] - g.mu) ** 2 + g.beta * s2
+    rows = {f"하루 VaR {lv:.0%}": var_exception_tests(hits[lv], 1 - lv) for lv in levels}
+    return pd.DataFrame(rows).T
 
 
 def var_es(log_returns, level=0.95):
@@ -305,7 +411,7 @@ VOL_STRATEGIES = {"signal": "GARCH 신호대로", "short": "항상 변동성 매
 
 def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
                         fit_window=750, min_history=500, dist="t", iv_gap=0.0, option_spread=0.0,
-                        offset=0, forecasts=None):
+                        offset=0, forecasts=None, lag=1, daily_iv_hedge=True):
     """과거 IV(예: VIX)로 '변동성 신호대로 ATM 스트래들을 사고팔며 매일 델타헤지'한 성적 (워크포워드).
 
     각 진입일 t: t까지의 수익률로만 GARCH 적합 → h일 평균 변동성 예측, 그날 종가의 IV와 비교해 신호.
@@ -316,29 +422,36 @@ def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, 
             → 신호·가격에 쓰는 IV = 지수 − iv_gap.
     option_spread: 옵션 체결 비용 (스트래들 가격 대비, 진입할 때 한 번 — 만기까지 들고 가 자동 정산되므로 청산 거래 없음).
     offset: 첫 진입을 며칠 늦출지 (진입일에 따라 결과가 얼마나 흔들리는지 볼 때).
-    forecasts: {진입일: GARCH 예측} — 같은 진입일로 설정만 바꿔 다시 돌릴 때 GARCH 재적합을 건너뛴다.
-    반환: 진입일별 표 — long은 롱 스트래들 헤지 손익(비용 전), cost는 헤지·옵션 체결 비용, premium은 스트래들 가격
-          (모두 주가 대비), iv는 보정한 IV, iv_index는 원래 지수 값.
+    forecasts: {판단일: GARCH 예측} — 같은 판단일로 설정만 바꿔 다시 돌릴 때 GARCH 재적합을 건너뛴다.
+    lag: 판단(그날 종가까지의 정보)과 실제 진입 사이 거래일 수. 1(기본) = 다음 날 종가에 진입,
+         0 = 판단한 날 종가에 바로 진입(그 종가는 장이 끝나야 알 수 있으므로 낙관적).
+    daily_iv_hedge: True(기본)면 매일 그날의 IV(지수 − iv_gap)로 델타를 다시 계산, False면 진입 IV 하나로 헤지.
+    반환: 판단일별 표 — long은 롱 스트래들 헤지 손익(비용 전), cost는 헤지·옵션 체결 비용, premium은 스트래들 가격
+          (모두 진입일 주가 대비), iv는 판단에 쓴 IV, iv_entry는 진입 가격에 쓴 IV, iv_index는 판단일의 지수 값.
     """
     df = pd.concat({"px": close, "iv": iv}, axis=1, join="inner").dropna()
     px, ivs, dates = df["px"].values, df["iv"].values, df.index
     lr = np.diff(np.log(px))                     # lr[k] = k → k+1일 로그수익률
-    ii = np.arange(min_history + offset, len(px) - h, h)
+    ii = np.arange(min_history + offset, len(px) - h - lag, h)          # 판단일
     if len(ii) == 0:
         return pd.DataFrame()
+    jj = ii + lag                                                        # 실제 진입일
     f = np.array([forecasts[dates[i]] if forecasts is not None and dates[i] in forecasts
                   else GarchVolForecaster(dist=dist).fit(lr[max(0, i - fit_window):i]).forecast_vol(h) for i in ii])
-    sigma = np.maximum(ivs[ii] - iv_gap, 0.01)
-    T = np.maximum(np.asarray((dates[ii + h] - dates[ii]).days, float), 1.0) / 365
-    paths = px[ii[:, None] + np.arange(h + 1)]                  # 진입별 h+1일 가격 경로 — 모든 진입을 한 번에 계산
+    sig_dec = np.maximum(ivs[ii] - iv_gap, 0.01)                         # 판단에 쓰는 IV (판단일까지의 정보)
+    sigma = np.maximum(ivs[jj] - iv_gap, 0.01)                           # 진입 가격에 쓰는 IV
+    T = np.maximum(np.asarray((dates[jj + h] - dates[jj]).days, float), 1.0) / 365
+    steps = jj[:, None] + np.arange(h + 1)
+    paths = px[steps]                                                    # 진입별 h+1일 가격 경로 — 모든 진입을 한 번에 계산
+    sig_path = np.maximum(ivs[steps] - iv_gap, 0.01) if daily_iv_hedge else None
     s0 = paths[:, 0]
-    gross = hedged_straddle_pnl(paths, T, r, sigma, q, 0.0)
+    gross = hedged_straddle_pnl(paths, T, r, sigma, q, 0.0, sig_path)
     premium = straddle_price(s0, s0, T, r, sigma, q)
-    cost = gross - hedged_straddle_pnl(paths, T, r, sigma, q, cost_bps) + option_spread * premium   # 방향과 무관한 비용
+    cost = gross - hedged_straddle_pnl(paths, T, r, sigma, q, cost_bps, sig_path) + option_spread * premium   # 방향과 무관
     logic = VolatilityTradingLogic(vrp, threshold)
-    out = pd.DataFrame({"garch": f, "iv": sigma, "iv_index": ivs[ii],
-                        "realized": np.sqrt(np.mean(lr[ii[:, None] + np.arange(h)] ** 2, axis=1) * 252),
-                        "signal": [logic.generate_signal(a, b) for a, b in zip(f, sigma)],
+    out = pd.DataFrame({"garch": f, "iv": sig_dec, "iv_entry": sigma, "iv_index": ivs[ii],
+                        "realized": np.sqrt(np.mean(lr[jj[:, None] + np.arange(h)] ** 2, axis=1) * 252),
+                        "signal": [logic.generate_signal(a, b) for a, b in zip(f, sig_dec)],
                         "long": gross / s0, "cost": cost / s0, "premium": premium / s0}, index=dates[ii])
     out.index.name = "date"
     return out
@@ -368,7 +481,8 @@ def summarize_vol_backtest(bt, h=21):
 
 
 def vol_backtest_robustness(close, iv, base, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, r=0.0, q=0.0,
-                            iv_gap=0.0, option_spread=0.0, gaps=(0.0, 0.01, 0.02, 0.03), offsets=(0, 4, 8, 12, 16)):
+                            iv_gap=0.0, option_spread=0.0, gaps=(0.0, 0.01, 0.02, 0.03), offsets=(0, 4, 8, 12, 16),
+                            lag=1, daily_iv_hedge=True):
     """현실성 점검 (base = iv_gap·진입일 0으로 이미 돌린 vol_signal_backtest 결과).
 
     (차이 × 진입일) 모든 조합을 돌린다. GARCH 예측은 진입일마다 한 번만 적합하고 차이별로 재사용한다.
@@ -376,7 +490,8 @@ def vol_backtest_robustness(close, iv, base, vrp=0.0, threshold=0.02, h=21, cost
     by_offset: 첫 진입일을 0~16거래일 늦춰 가며 → 진입일 운에 따라 결과가 얼마나 흔들리는지.
     grid: {(차이, 진입일 늦춤): 백테스트 표} — short_only_robustness에 넘긴다.
     """
-    kw = dict(vrp=vrp, threshold=threshold, h=h, cost_bps=cost_bps, r=r, q=q, option_spread=option_spread)
+    kw = dict(vrp=vrp, threshold=threshold, h=h, cost_bps=cost_bps, r=r, q=q, option_spread=option_spread,
+              lag=lag, daily_iv_hedge=daily_iv_hedge)
     grid = {(iv_gap, 0): base}
     for o in offsets:
         if (iv_gap, o) not in grid:
