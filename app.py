@@ -40,12 +40,19 @@ def get_market(ticker, years, horizon):
     return close, spot, r, q, opt, r_src
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_direction(ticker, h, cost_bps):
-    """방향 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_direction_inputs(ticker):
+    """방향 모델 입력: 최대 10년치 종가 + 거시 + 대체 데이터. 예측 기간과 무관하므로 따로 캐시한다."""
     close = md.load_history(ticker, 10)
     macro = md.load_macro(ticker)
     alt, alt_status = ad.build_alt_features(ticker, close.index)
+    return close, macro, alt, alt_status
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_direction(ticker, h, cost_bps):
+    """방향 모델은 표본이 많이 필요해서 학습 기간 설정과 별개로 최대 10년치를 쓴다."""
+    close, macro, alt, alt_status = get_direction_inputs(ticker)
     # 거시 지표 시차는 티커로 자동 결정 (한국 종목이면 미국 지표를 하루 늦춤)
     wf, _ = dr.walk_forward(close, h, macro, alt=alt, ticker=ticker)
     if wf.empty:
@@ -59,6 +66,32 @@ def get_direction(ticker, h, cost_bps):
         alt_status["한국은행 금리(ECOS)"] = ("키 없음" if not kr_data.get_key("ECOS_API_KEY") else
                                        "사용" if macro is not None and "kr3y" in macro else "오류")
     return p_up, pick, now_all, contrib, asof, wf, ev, close, alt_status
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_direction_robustness(ticker, h, cost_bps):
+    """방향 예측을 가정을 바꿔 다시 채점 (이미 계산된 워크포워드 예측 재사용, 재학습 없음)."""
+    res = get_direction(ticker, h, cost_bps)
+    wf, close = res[5], res[7]
+    return dr.robustness(wf, h, np.log(close).diff(), cost_bps)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_direction_horizons(ticker, cost_bps):
+    """예측 기간 5·10·21·42·63일로 워크포워드를 다시 돌린다 (무거워서 점검용으로 3개월마다 재학습)."""
+    close, macro, alt, _ = get_direction_inputs(ticker)
+    return dr.horizon_check(close, macro, alt, ticker, cost_bps)
+
+
+def robust_table(df):
+    """방향 예측 점검 표 (검증 통과는 글자로)."""
+    d = df.assign(**{"검증 통과": df["검증 통과"].map({True: "통과", False: "—"})})
+    first = [c for c in ("가장 많이 고른 모델",) if c in d]
+    d = d[first + [c for c in d.columns if c not in first]]
+    st.dataframe(d.style.format({"적중률": "{:.1%}", "'항상 오른다' 대비": "{:+.1%}", "확률 정확도 개선": "{:+.1%}",
+                                 "z": "{:+.1f}", "전략 샤프": "{:.2f}", "단순 보유 샤프": "{:.2f}", "전략 최대 낙폭": "{:.0%}",
+                                 "보유 비중": "{:.0%}"}, na_rep="—"), width="stretch",
+                 column_config={"검증 통과": st.column_config.TextColumn("검증 통과", alignment="center")})
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -382,6 +415,48 @@ with tab_dir:
             fig.update_yaxes(title_text="종가", row=2, col=1)
             fig.update_layout(height=420, hovermode="x unified", legend=dict(orientation="h", y=1.08))
             ui.chart(fig)
+
+            # ---- 가정을 바꿔도 결과가 같을까?
+            st.subheader("가정을 바꿔도 결과가 같을까?")
+            st.markdown("자동 선택이 보는 과거 기간, 보유 기준, 거래비용, 시기, 예측 기간을 바꿔 다시 채점합니다. "
+                        "예측 기간을 빼고는 이미 계산된 예측을 다시 쓰므로 모델을 새로 학습하지 않습니다.")
+            RB = get_direction_robustness(ticker, dir_h, cost_bps)
+            bw, br, bp = RB["by_window"], RB["by_rule"], RB["by_period"]
+            n_pass, n_all = int(bw["검증 통과"].sum() + bp["검증 통과"].sum()), len(bw) + len(bp)
+            n_beat = int((br.values > 0).sum())
+            label, kind = (("모든 경우 통과", "approve") if n_pass == n_all else
+                           ("절반 이상 통과", "elective") if n_pass * 2 >= n_all else
+                           ("일부에서만 통과", "elective") if n_pass else ("한 번도 통과 못 함", "reject"))
+            ui.verdict(f"{dir_h}거래일 방향 예측 · 선택 기간 {len(bw)}가지 + 시기 {len(bp)}구간", f"{n_pass} / {n_all}",
+                       "경우에서 검증 통과", [(label, kind)],
+                       f"검증 통과 = 확률 정확도가 기본 확률보다 좋고, 적중률 우위가 우연이 아닌 경우(z > 2). "
+                       f"보유 기준 × 거래비용 {br.size}가지 중 전략 샤프가 단순 보유보다 높았던 경우는 {n_beat}가지였습니다.")
+
+            st.markdown("**① 자동 선택이 보는 과거 기간** — 최근 몇 년의 성적으로 후보 모델을 고를지")
+            robust_table(bw)
+            st.caption("지금 앱은 '최근 3년'을 씁니다. 기간에 따라 고르는 모델과 결과가 크게 바뀌면, 모델 선택이 운에 좌우된다는 뜻입니다.")
+
+            st.markdown("**② 보유 기준 × 거래비용** — '상승 확률이 기준보다 높으면 보유' 전략의 샤프 − 단순 보유 샤프")
+            st.dataframe(br.style.format("{:+.2f}").map(
+                lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
+            st.caption("+면 그 설정에서 전략이 단순 보유보다 위험 대비 수익이 좋았다는 뜻입니다. 자동 선택이 '기본 확률'을 고른 기간에는 "
+                       "확률이 과거 상승 비율로 고정되므로, 기준을 그보다 높게 잡으면 그 기간 내내 현금, 낮게 잡으면 내내 보유가 됩니다. "
+                       "그래서 기준에 따라 결과가 크게 갈리면 모델의 예측력보다 기준 설정의 영향이 큰 것입니다.")
+
+            st.markdown("**③ 시기별** — 검증 기간을 세 구간으로 나눠 채점")
+            robust_table(bp)
+            st.caption("한 구간은 약 2~3년이라 표본이 작아 z가 낮게 나오기 쉽습니다. 구간마다 방향(+/−)이 일관적인지를 보세요.")
+
+            st.markdown("**④ 예측 기간을 바꿔 보면** — 5·10·21·42·63거래일 (모델을 새로 학습해서 무겁습니다)")
+            if st.button("예측 기간 바꿔 점검", key="dir_h_check"):
+                try:
+                    with st.spinner("예측 기간 5가지로 처음부터 다시 학습·검증하는 중… (1~3분)"):
+                        HZ = get_direction_horizons(ticker, cost_bps)
+                    robust_table(HZ)
+                    st.caption(f"검증 통과 {int(HZ['검증 통과'].sum())} / {len(HZ)}. 점검용으로 3개월(63거래일)마다 재학습해서, "
+                               "위 결과(한 달마다 재학습)와 숫자가 조금 다를 수 있습니다.")
+                except Exception as e:
+                    st.error(f"계산 실패: {e}")
 
 # ---------------- 코스피 종목 고르기 ----------------
 with tab_pick:
