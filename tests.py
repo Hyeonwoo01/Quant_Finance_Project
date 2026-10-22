@@ -135,7 +135,10 @@ assert rb_m["by_rule"].shape == (3, 4) and list(rb_m["by_rule"].index) == ["45%"
 assert (rb_m["by_window"]["확률 정확도 개선"] > 0.01).all()      # 심어 둔 모멘텀은 선택 기간과 상관없이 잡혀야
 assert not dr.robustness(wf_a, 21, np.log(px).diff())["by_window"]["검증 통과"].any()   # 순수 무작위 가격은 통과 못 해야
 assert dr.evaluate(wf_a, 21, np.log(px).diff(), threshold=1.0)["time_in_market"] == 0.0
-hz = dr.horizon_check(px_m.iloc[:1400], horizons=(5, 21))
+assert "gbm" not in dr.make_candidates(cols_a, light=True) and "logit_all" in dr.make_candidates(cols_a, light=True)
+wl, _ = dr.walk_forward(px, 21, light=True)
+assert "gbm" not in wl and "ensemble" not in wl and np.allclose(wl["logit_price"], wf_a["logit_price"])   # 가벼운 점검도 같은 로지스틱
+hz = dr.horizon_check(px_m, horizons=(5, 21))                  # 가벼운 점검(로지스틱)도 심어 둔 신호를 잡아야
 assert list(hz.index) == ["5거래일", "21거래일"] and hz.loc["5거래일", "확률 정확도 개선"] > 0
 
 # DART 공시: 분류 + '접수일 다음 거래일'부터 반영되는지 (네트워크 없이 공시 목록을 가짜로 주입)
