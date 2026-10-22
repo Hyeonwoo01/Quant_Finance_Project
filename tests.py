@@ -111,6 +111,33 @@ assert "eps_surprise" in cols_a and "logit_alt" in wa
 up_to = wa.index <= px.index[T]
 assert np.allclose(wa["auto"][up_to], wb["auto"][up_to]) and np.allclose(wa["logit_alt"][up_to], wb["logit_alt"][up_to])
 
+# 앙상블은 '로지스틱·전체'와 '부스팅'의 평균 — 다시 학습하지 않고 평균만 내도 정의와 같다
+assert "logit_all" in wa and np.allclose(wa["ensemble"], (wa["logit_all"] + wa["gbm"]) / 2)
+_c = dr.make_candidates(cols_a)
+_X = dr.build_features(px, alt=alt_a).values
+_y = (rng.random(len(_X)) < 0.5).astype(float)
+_fp = dr.fit_predict_all(dr.make_candidates(cols_a), _X[:800], _y[:800], _X[800:900])
+assert np.allclose(_fp["ensemble"], _c["ensemble"].fit(_X[:800], _y[:800]).predict_proba(_X[800:900]))
+_cols_p = list(dr.build_features(px).columns)                         # 가격 특징만 ('로지스틱·전체' 후보 없음)
+_Xp = dr.build_features(px).values
+_cp = dr.make_candidates(_cols_p)
+assert "logit_all" not in _cp
+assert np.allclose(dr.fit_predict_all(dr.make_candidates(_cols_p), _Xp[:800], _y[:800], _Xp[800:900])["ensemble"],
+                   _cp["ensemble"].fit(_Xp[:800], _y[:800]).predict_proba(_Xp[800:900]))
+
+# 가정 바꿔 점검: 자동 선택만 다시 하면(재학습 없음) 같은 기간에서 워크포워드와 똑같아야 하고, 표 모양이 맞아야 한다
+rs = dr.reselect(wf_a, 21, 756)
+assert np.allclose(rs["auto"], wf_a["auto"]) and (rs["chosen"] == wf_a["chosen"]).all()
+assert (dr.reselect(wf_a, 21, 10_000, min_scored=10_000)["chosen"] == "base").all()      # 채점 표본 부족 → 기본 확률
+rb_m = dr.robustness(wf_m, 5, np.log(px_m).diff(), 1.0)
+assert list(rb_m["by_window"].index) == ["최근 1년", "최근 2년", "최근 3년", "최근 5년"] and len(rb_m["by_period"]) == 3
+assert rb_m["by_rule"].shape == (3, 4) and list(rb_m["by_rule"].index) == ["45%", "50%", "55%"]
+assert (rb_m["by_window"]["확률 정확도 개선"] > 0.01).all()      # 심어 둔 모멘텀은 선택 기간과 상관없이 잡혀야
+assert not dr.robustness(wf_a, 21, np.log(px).diff())["by_window"]["검증 통과"].any()   # 순수 무작위 가격은 통과 못 해야
+assert dr.evaluate(wf_a, 21, np.log(px).diff(), threshold=1.0)["time_in_market"] == 0.0
+hz = dr.horizon_check(px_m.iloc[:1400], horizons=(5, 21))
+assert list(hz.index) == ["5거래일", "21거래일"] and hz.loc["5거래일", "확률 정확도 개선"] > 0
+
 # DART 공시: 분류 + '접수일 다음 거래일'부터 반영되는지 (네트워크 없이 공시 목록을 가짜로 주입)
 import kr_data
 

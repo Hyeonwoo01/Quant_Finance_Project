@@ -222,6 +222,23 @@ def make_candidates(columns):
     return cands
 
 
+def fit_predict_all(cands, X_train, y_train, X_new):
+    """모든 후보를 학습해 X_new의 상승 확률을 낸다.
+
+    앙상블은 '로지스틱(전체 특징, l2=10)'과 '부스팅'의 평균이고, 부스팅 설정이 'gbm' 후보와 똑같으므로
+    부스팅을 다시 학습하지 않고 그 예측을 재사용한다 ('로지스틱·전체' 후보가 있으면 그것도 재사용).
+    결과는 그대로이고 가장 무거운 부스팅 학습이 절반으로 줄어든다.
+    """
+    out = {}
+    for k, m in cands.items():
+        if k == "ensemble" and "gbm" in out:
+            lg = out["logit_all"] if "logit_all" in out else m.parts[0].fit(X_train, y_train).predict_proba(X_new)
+            out[k] = (lg + out["gbm"]) / 2
+        else:
+            out[k] = m.fit(X_train, y_train).predict_proba(X_new)
+    return out
+
+
 def _logloss(p, y):
     p = np.clip(p, 1e-6, 1 - 1e-6)
     return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
@@ -246,8 +263,8 @@ def walk_forward(close, h, macro=None, lag_macro=None, alt=None, min_train=500, 
     for t in range(min_train + h, n, refit_every):
         end = min(t + refit_every, n)
         tr = slice(0, t - h + 1)
-        for k, model in make_candidates(feat.columns).items():
-            probs[k][t:end] = model.fit(X[tr], y[tr]).predict_proba(X[t:end])
+        for k, p in fit_predict_all(make_candidates(feat.columns), X[tr], y[tr], X[t:end]).items():
+            probs[k][t:end] = p
 
         known = np.arange(n) <= t - h                       # 결과가 확정된 행만 채점
         scored = known & ~np.isnan(probs["base"])
@@ -280,12 +297,12 @@ def score(prob, fwd, h):
             "skill": 1 - brier / brier_base if brier_base > 0 else 0.0, "n": int(len(p)), "n_eff": n_eff}
 
 
-def evaluate(wf, h, daily_returns, cost_bps=0.0):
-    """모든 후보와 자동 선택을 채점 + 자동 선택의 '상승 확률>50%면 보유' 전략 vs 단순 보유."""
+def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5):
+    """모든 후보와 자동 선택을 채점 + 자동 선택의 '상승 확률 > threshold면 보유' 전략 vs 단순 보유."""
     cols = [c for c in MODEL_LABELS if c in wf] + ["auto"]
     table = {c: score(wf[c], wf["fwd"], h) for c in cols}
 
-    pos = (wf["auto"] > 0.5).astype(float)
+    pos = (wf["auto"] > threshold).astype(float)
     nxt = daily_returns.shift(-1).reindex(wf.index).fillna(0.0)    # t일 종가에 결정 → t+1일 수익률
     turnover = pos.diff().abs().fillna(pos.iloc[0])
     strat = pos * nxt - turnover * cost_bps * 1e-4
@@ -298,6 +315,76 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0):
             "chosen_share": wf["chosen"].value_counts(normalize=True)}
 
 
+# ---------------- 가정 바꿔 점검 ----------------
+def reselect(wf, h, select_window=756, min_scored=252, refit_every=21):
+    """저장된 후보별 예측으로 '자동 선택'만 다시 한다 (재학습 없음).
+
+    walk_forward와 같은 블록(refit_every)·같은 규칙: 블록 시작 t에서 결과가 확정된(행 ≤ t−h) 최근 select_window개
+    예측의 로그손실이 가장 낮은 후보. 채점된 예측이 min_scored개 미만이면 기본 확률.
+    """
+    names = [c for c in MODEL_LABELS if c in wf]
+    P = {k: wf[k].values for k in names}
+    y = (wf["fwd"].values > 0).astype(float)
+    n = len(wf)
+    auto, chosen = np.full(n, np.nan), np.full(n, None, dtype=object)
+    for b in range(0, n, refit_every):
+        end = min(b + refit_every, n)
+        idx = np.arange(0, max(b - h + 1, 0))[-select_window:]
+        pick = min(names, key=lambda k: _logloss(P[k][idx], y[idx])) if len(idx) >= min_scored else "base"
+        auto[b:end], chosen[b:end] = P[pick][b:end], pick
+    out = wf.copy()
+    out["auto"], out["chosen"] = auto, chosen
+    return out
+
+
+def _robust_row(ev):
+    return {"적중률": ev["hit"], "'항상 오른다' 대비": ev["hit"] - ev["base"], "확률 정확도 개선": ev["skill"],
+            "z": ev["z"], "검증 통과": bool(ev["skill"] > 0 and ev["z"] > 2),
+            "전략 샤프": ev["sharpe"], "단순 보유 샤프": ev["sharpe_bh"], "전략 최대 낙폭": ev["mdd"],
+            "보유 비중": ev["time_in_market"]}
+
+
+def robustness(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260),
+               thresholds=(0.45, 0.5, 0.55), costs=(1.0, 5.0, 10.0, 20.0), n_periods=3):
+    """방향 예측을 가정을 바꿔 다시 채점한다 (모두 이미 계산된 워크포워드 예측을 재사용, 재학습 없음).
+
+    by_window: 자동 선택이 보는 과거 성적 기간(1·2·3·5년)을 바꿔 다시 고르기.
+    by_rule: '상승 확률 > 기준이면 보유'의 기준 × 거래비용 → 전략 샤프 − 단순 보유 샤프.
+    by_period: 검증 기간을 n_periods개로 나눠 시기마다 채점 (예측력이 한때만 있었는지).
+    """
+    by_window = {}
+    for w in windows:
+        rw = reselect(wf, h, w)
+        row = _robust_row(evaluate(rw, h, daily_returns, cost_bps))
+        top = rw["chosen"].value_counts(normalize=True)
+        row["가장 많이 고른 모델"] = f"{MODEL_LABELS[top.index[0]]} {top.iloc[0]:.0%}"
+        by_window[f"최근 {w // 252}년"] = row
+    rule = {}
+    for th in thresholds:
+        for c in costs:
+            ev = evaluate(wf, h, daily_returns, c, threshold=th)
+            rule[(f"{th:.0%}", f"{c:g}bp")] = ev["sharpe"] - ev["sharpe_bh"]
+    by_rule = pd.Series(rule).unstack()[[f"{c:g}bp" for c in costs]]
+    by_rule.index.name, by_rule.columns.name = "보유 기준", "거래비용"
+    by_period = {}
+    for part in np.array_split(np.arange(len(wf)), n_periods):
+        sub = wf.iloc[part]
+        by_period[f"{sub.index[0].date()} ~ {sub.index[-1].date()}"] = _robust_row(evaluate(sub, h, daily_returns, cost_bps))
+    return {"by_window": pd.DataFrame(by_window).T, "by_rule": by_rule, "by_period": pd.DataFrame(by_period).T}
+
+
+def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizons=(5, 10, 21, 42, 63), refit_every=63):
+    """예측 기간을 바꿔 워크포워드를 처음부터 다시 돌린다 (무거워서 점검용으로 refit_every일마다 재학습)."""
+    r = np.log(close).diff()
+    rows = {}
+    for h in horizons:
+        wf, _ = walk_forward(close, h, macro, alt=alt, ticker=ticker, refit_every=refit_every)
+        if wf.empty:
+            continue
+        rows[f"{h}거래일"] = _robust_row(evaluate(wf, h, r, cost_bps))
+    return pd.DataFrame(rows).T
+
+
 def predict_now(close, h, wf, macro=None, lag_macro=None, alt=None, select_window=756, ticker=None):
     """결과가 확정된 모든 과거로 학습 → 오늘의 P(상승).
 
@@ -308,7 +395,7 @@ def predict_now(close, h, wf, macro=None, lag_macro=None, alt=None, select_windo
     known = fwd.notna().values
     X, y = feat.values, (fwd.values > 0).astype(float)
     cands = make_candidates(feat.columns)
-    now = {k: float(m.fit(X[known], y[known]).predict_proba(X[-1:])[0]) for k, m in cands.items()}
+    now = {k: float(p[0]) for k, p in fit_predict_all(cands, X[known], y[known], X[-1:]).items()}
 
     scored = wf.dropna(subset=["fwd"]).iloc[-select_window:]
     yy = (scored["fwd"].values > 0).astype(float)
