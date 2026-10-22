@@ -78,19 +78,43 @@ def get_direction_robustness(ticker, h, cost_bps):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_direction_horizons(ticker, cost_bps):
-    """예측 기간 5·10·21·42·63일로 워크포워드를 다시 돌린다 (무거워서 점검용으로 3개월마다 재학습)."""
+    """예측 기간 5·10·21·42·63일로 워크포워드를 다시 돌린다 (빠른 점검용: 부스팅·앙상블 제외)."""
     close, macro, alt, _ = get_direction_inputs(ticker)
     return dr.horizon_check(close, macro, alt, ticker, cost_bps)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_direction_horizons_full(ticker, cost_bps):
+    """부스팅까지 포함한 예측 기간 점검 — 무거워서 1년마다 재학습.
+
+    같은 1년 주기로 '로지스틱만' 점검도 함께 돌려, 두 결과의 차이가 부스팅 때문인지만 비교되게 한다.
+    """
+    close, macro, alt, _ = get_direction_inputs(ticker)
+    full = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=False, refit_every=252)
+    light = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=True, refit_every=252)
+    return full, light
+
+
+def _signed(digits=2):
+    """부호 붙인 숫자. 반올림해서 0이면 부호 없이 — 아주 작은 음수가 '-0.00'으로 보이지 않게."""
+    return lambda v: "—" if pd.isna(v) else f"{0:.{digits}f}" if round(v, digits) == 0 else f"{v:+.{digits}f}"
+
+
+def signed_table(df, digits=2):
+    """+/− 차이 표: +는 초록, −는 빨강, 반올림해서 0이면 색 없음."""
+    d = df.astype(float).round(digits) + 0.0
+    st.dataframe(d.style.format(_signed(digits)).map(
+        lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
 
 
 def robust_table(df):
     """방향 예측 점검 표 (검증 통과는 글자로)."""
     d = df.assign(**{"검증 통과": df["검증 통과"].map({True: "통과", False: "—"})})
-    first = [c for c in ("가장 많이 고른 모델",) if c in d]
+    first = [c for c in ("가장 많이 고른 모델", "부스팅·앙상블 선택 비율") if c in d]
     d = d[first + [c for c in d.columns if c not in first]]
     st.dataframe(d.style.format({"적중률": "{:.1%}", "'항상 오른다' 대비": "{:+.1%}", "확률 정확도 개선": "{:+.1%}",
-                                 "z": "{:+.1f}", "전략 샤프": "{:.2f}", "단순 보유 샤프": "{:.2f}", "전략 최대 낙폭": "{:.0%}",
-                                 "보유 비중": "{:.0%}"}, na_rep="—"), width="stretch",
+                                 "z": _signed(1), "전략 샤프": "{:.2f}", "단순 보유 샤프": "{:.2f}", "전략 최대 낙폭": "{:.0%}",
+                                 "보유 비중": "{:.0%}", "부스팅·앙상블 선택 비율": "{:.0%}"}, na_rep="—"), width="stretch",
                  column_config={"검증 통과": st.column_config.TextColumn("검증 통과", alignment="center")})
 
 
@@ -437,8 +461,10 @@ with tab_dir:
             st.caption("지금 앱은 '최근 3년'을 씁니다. 기간에 따라 고르는 모델과 결과가 크게 바뀌면, 모델 선택이 운에 좌우된다는 뜻입니다.")
 
             st.markdown("**② 보유 기준 × 거래비용** — '상승 확률이 기준보다 높으면 보유' 전략의 샤프 − 단순 보유 샤프")
-            st.dataframe(br.style.format("{:+.2f}").map(
-                lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
+            signed_table(br)
+            if (br.abs().round(2) == 0).all().all():
+                st.caption("모든 칸이 0인 이유: 자동 선택이 거의 늘 '기본 확률'을 골랐고, 그 확률(과거 상승 비율)이 모든 보유 기준보다 "
+                           "높아서 전략이 내내 보유했습니다. 즉 단순 보유와 똑같았다는 뜻입니다.")
             st.caption("+면 그 설정에서 전략이 단순 보유보다 위험 대비 수익이 좋았다는 뜻입니다. 자동 선택이 '기본 확률'을 고른 기간에는 "
                        "확률이 과거 상승 비율로 고정되므로, 기준을 그보다 높게 잡으면 그 기간 내내 현금, 낮게 잡으면 내내 보유가 됩니다. "
                        "그래서 기준에 따라 결과가 크게 갈리면 모델의 예측력보다 기준 설정의 영향이 큰 것입니다.")
@@ -447,14 +473,38 @@ with tab_dir:
             robust_table(bp)
             st.caption("한 구간은 약 2~3년이라 표본이 작아 z가 낮게 나오기 쉽습니다. 구간마다 방향(+/−)이 일관적인지를 보세요.")
 
-            st.markdown("**④ 예측 기간을 바꿔 보면** — 5·10·21·42·63거래일 (모델을 새로 학습해서 무겁습니다)")
+            st.markdown("**④ 예측 기간을 바꿔 보면** — 5·10·21·42·63거래일 (모델을 새로 학습하는 가벼운 점검)")
             if st.button("예측 기간 바꿔 점검", key="dir_h_check"):
                 try:
-                    with st.spinner("예측 기간 5가지로 처음부터 다시 학습·검증하는 중… (1~3분)"):
+                    with st.spinner("예측 기간 5가지로 다시 학습·검증하는 중… (보통 1분 안팎)"):
                         HZ = get_direction_horizons(ticker, cost_bps)
                     robust_table(HZ)
-                    st.caption(f"검증 통과 {int(HZ['검증 통과'].sum())} / {len(HZ)}. 점검용으로 3개월(63거래일)마다 재학습해서, "
-                               "위 결과(한 달마다 재학습)와 숫자가 조금 다를 수 있습니다.")
+                    gbm_share = ev["chosen_share"].reindex(["gbm", "ensemble"]).fillna(0).sum()
+                    st.caption(f"검증 통과 {int(HZ['검증 통과'].sum())} / {len(HZ)}. 빠르게 돌리려고 무거운 부스팅·앙상블 후보를 빼고 "
+                               "기본 확률·로지스틱 후보만으로 다시 학습했습니다(재학습 주기는 위와 같은 한 달). "
+                               f"위 결과에서 부스팅·앙상블이 골라진 비율은 {gbm_share:.0%}"
+                               + ("라서 이 점검과 결론이 크게 다르지 않습니다." if gbm_share < 0.2 else
+                                  "로 높아서, 이 점검은 그 모델의 성적을 반영하지 못합니다."))
+                except Exception as e:
+                    st.error(f"계산 실패: {e}")
+
+            st.markdown("**④-2 부스팅까지 포함해 점검** — 기간이 길수록 비선형 모델이 나을 수 있는지 확인 (무겁습니다)")
+            if st.button("부스팅까지 포함해 점검", key="dir_h_check_full"):
+                try:
+                    with st.spinner("모든 후보로 예측 기간 5가지를 다시 학습하는 중… (무료 서버에서는 몇 분 걸릴 수 있습니다)"):
+                        HF, HL = get_direction_horizons_full(ticker, cost_bps)
+                    robust_table(HF)
+                    cmp = pd.DataFrame({"로지스틱만": HL["확률 정확도 개선"], "부스팅 포함": HF["확률 정확도 개선"]}).astype(float)
+                    cmp["차이 (부스팅 포함 − 로지스틱만)"] = cmp["부스팅 포함"] - cmp["로지스틱만"]
+                    st.markdown("확률 정확도 개선 비교 — 같은 조건(1년마다 재학습)에서 부스팅·앙상블 후보만 넣고 뺀 차이")
+                    st.dataframe(cmp.style.format({"로지스틱만": "{:+.1%}", "부스팅 포함": "{:+.1%}"}).format(
+                        lambda v: "0.0%p" if round(v * 100, 1) == 0 else f"{v * 100:+.1f}%p",
+                        subset=["차이 (부스팅 포함 − 로지스틱만)"]).map(
+                        lambda v: f"color: {ui.APPROVE}" if round(v * 100, 1) > 0 else f"color: {ui.REJECT}" if round(v * 100, 1) < 0 else "",
+                        subset=["차이 (부스팅 포함 − 로지스틱만)"]), width="stretch")
+                    st.caption(f"검증 통과 {int(HF['검증 통과'].sum())} / {len(HF)}. 무거워서 1년(252거래일)마다 재학습했고, 비교용 '로지스틱만'도 "
+                               "같은 주기로 돌렸습니다. 차이가 +이고 긴 기간(42·63일)에서 커지면 부스팅이 긴 기간에 도움이 된다는 신호지만, "
+                               "63일 예측은 10년치라도 서로 독립적인 표본이 30개 안팎이라 z가 2를 넘기 어렵습니다 — 검증 통과 여부를 꼭 함께 보세요.")
                 except Exception as e:
                     st.error(f"계산 실패: {e}")
 
@@ -962,8 +1012,7 @@ with tab3:
                         diff_name = "샤프 차이 (다시 고른 규칙 − 항상 매도)"
                     piv = rob.assign(d=diff).pivot(index="차이", columns="진입", values="d").reindex(index=gaps_s, columns=offs_s)
                     st.markdown(f"{diff_name}, 뒤 기간 — 행: {vix_name}와 ATM IV의 차이, 열: 첫 진입일")
-                    st.dataframe(piv.style.format("{:+.2f}").map(
-                        lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
+                    signed_table(piv)
                     with st.expander("조합별 자세히"):
                         st.dataframe(rob.style.format({c: "{:.2f}" for c in rob.columns if "샤프" in c} |
                                                       {c: "{:+.1f}" for c in rob.columns if "t값" in c} |

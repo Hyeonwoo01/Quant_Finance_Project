@@ -208,7 +208,8 @@ class _Ensemble:
         return np.mean([p.predict_proba(X) for p in self.parts], axis=0)
 
 
-def make_candidates(columns):
+def make_candidates(columns, light=False):
+    """후보 모델들. light=True면 무거운 부스팅·앙상블을 빼고 기본 확률·로지스틱만 (빠른 점검용)."""
     price_idx = [i for i, c in enumerate(columns) if c in PRICE_FEATURES]
     alt_idx = [i for i, c in enumerate(columns) if c in ALT_FEATURES]
     all_idx = list(range(len(columns)))
@@ -217,6 +218,8 @@ def make_candidates(columns):
         cands["logit_alt"] = _Logit(alt_idx, 1.0)
     if len(all_idx) > len(price_idx):           # 거시/대체 데이터가 있을 때만
         cands["logit_all"] = _Logit(all_idx, 10.0)
+    if light:
+        return cands
     cands["gbm"] = _GBM()
     cands["ensemble"] = _Ensemble([_Logit(all_idx, 10.0), _GBM()])
     return cands
@@ -246,7 +249,7 @@ def _logloss(p, y):
 
 # ---------------- 워크포워드 ----------------
 def walk_forward(close, h, macro=None, lag_macro=None, alt=None, min_train=500, refit_every=21,
-                 select_window=756, min_scored=252, ticker=None):
+                 select_window=756, min_scored=252, ticker=None, light=False):
     """각 시점 t에서 't까지 알 수 있던 데이터'로만 모든 후보를 학습하고 예측한다.
 
     'auto' 열: 블록 시작 t에서, 결과가 이미 확정된(행 ≤ t−h) 과거 예측들 중 최근 select_window개의
@@ -256,14 +259,14 @@ def walk_forward(close, h, macro=None, lag_macro=None, alt=None, min_train=500, 
     fwd = forward_log_return(close, h).reindex(feat.index)
     X, y = feat.values, (fwd.values > 0).astype(float)
     n = len(feat)
-    names = list(make_candidates(feat.columns))
+    names = list(make_candidates(feat.columns, light))
     probs = {k: np.full(n, np.nan) for k in names}
     auto, chosen = np.full(n, np.nan), np.full(n, None, dtype=object)
 
     for t in range(min_train + h, n, refit_every):
         end = min(t + refit_every, n)
         tr = slice(0, t - h + 1)
-        for k, p in fit_predict_all(make_candidates(feat.columns), X[tr], y[tr], X[t:end]).items():
+        for k, p in fit_predict_all(make_candidates(feat.columns, light), X[tr], y[tr], X[t:end]).items():
             probs[k][t:end] = p
 
         known = np.arange(n) <= t - h                       # 결과가 확정된 행만 채점
@@ -373,15 +376,22 @@ def robustness(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260)
     return {"by_window": pd.DataFrame(by_window).T, "by_rule": by_rule, "by_period": pd.DataFrame(by_period).T}
 
 
-def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizons=(5, 10, 21, 42, 63), refit_every=63):
-    """예측 기간을 바꿔 워크포워드를 처음부터 다시 돌린다 (무거워서 점검용으로 refit_every일마다 재학습)."""
+def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizons=(5, 10, 21, 42, 63),
+                  refit_every=21, light=True):
+    """예측 기간을 바꿔 워크포워드를 처음부터 다시 돌린다.
+
+    light=True(기본): 무거운 부스팅·앙상블을 빼고 기본 확률·로지스틱 후보만 — 무료 서버에서도 1분 안팎.
+    light=False: 모든 후보 (부스팅이 골라진 비율 열 추가). 무거우므로 refit_every를 길게(예: 252) 잡아 쓴다.
+    """
     r = np.log(close).diff()
     rows = {}
     for h in horizons:
-        wf, _ = walk_forward(close, h, macro, alt=alt, ticker=ticker, refit_every=refit_every)
+        wf, _ = walk_forward(close, h, macro, alt=alt, ticker=ticker, refit_every=refit_every, light=light)
         if wf.empty:
             continue
         rows[f"{h}거래일"] = _robust_row(evaluate(wf, h, r, cost_bps))
+        if not light:          # 부스팅이 실제로 골라졌는지 — 0%면 부스팅을 넣어도 결과가 같다
+            rows[f"{h}거래일"]["부스팅·앙상블 선택 비율"] = float(wf["chosen"].isin(["gbm", "ensemble"]).mean())
     return pd.DataFrame(rows).T
 
 
