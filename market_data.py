@@ -1,6 +1,8 @@
 """yfinance로 실제 시장 데이터(주가·옵션 체인·금리·배당)를 가져온다."""
+import io
 import re
 import time
+import zipfile
 from datetime import date, datetime
 
 import numpy as np
@@ -150,6 +152,54 @@ def load_macro(ticker, years=10):
         except Exception:
             pass
     return d if len(d) > 500 else None
+
+
+# 미국 주식 요인 수익률 (Kenneth French 교수 데이터 라이브러리, 무료·일간, 보통 1~2개월 늦게 갱신)
+FRENCH_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/{}_CSV.zip"
+FRENCH_FILES = ("F-F_Research_Data_5_Factors_2x3_daily", "F-F_Momentum_Factor_daily")
+
+
+def parse_french_csv(text):
+    """French 라이브러리 CSV(앞뒤 설명 줄 + 'YYYYMMDD, 값…' 표, 단위 %) → 소수 단위 DataFrame (첫 번째 표만)."""
+    header, rows = None, []
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.split(",")]
+        if header is None:
+            if len(cells) > 1 and cells[0] == "" and any(re.search(r"[A-Za-z]", c) for c in cells[1:]):
+                header = cells[1:]
+            continue
+        if re.fullmatch(r"\d{8}", cells[0]):
+            rows.append([cells[0], *cells[1:len(header) + 1]])
+        elif rows:
+            break                                   # 첫 표가 끝남 (뒤는 저작권 줄이나 다른 표)
+    if not rows:
+        raise ValueError("French 데이터 형식을 읽지 못했습니다")
+    df = pd.DataFrame(rows, columns=["date", *header])
+    df.index = pd.to_datetime(df.pop("date"), format="%Y%m%d")
+    df = df.apply(pd.to_numeric, errors="coerce").where(lambda x: x > -99.0) / 100.0
+    return df.rename(columns=lambda c: c.strip())
+
+
+def load_fama_french(max_age_hours=24):
+    """파마-프렌치 5요인(Mkt-RF·SMB·HML·RMW·CMA) + 모멘텀(Mom) + 무위험 수익률(RF), 일간 소수 단위. 실패하면 None.
+
+    하루 동안 파일로 캐시한다 (원본은 한 달에 한 번 정도 갱신)."""
+    path = kr_data.CACHE / "fama_french_daily.pkl"
+    if path.exists() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
+        return pd.read_pickle(path)
+    try:
+        parts = []
+        for name in FRENCH_FILES:
+            raw = requests.get(FRENCH_URL.format(name), headers=_UA, timeout=30)
+            raw.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(raw.content)) as z:
+                parts.append(parse_french_csv(z.read(z.namelist()[0]).decode("latin-1")))
+        ff = parts[0].join(parts[1], how="inner").dropna()
+    except Exception:
+        return pd.read_pickle(path) if path.exists() else None      # 오래된 캐시라도 있으면 쓴다
+    kr_data.CACHE.mkdir(exist_ok=True)
+    ff.to_pickle(path)
+    return ff
 
 
 def risk_free_rate(ticker="", default=0.04):

@@ -7,7 +7,7 @@ import pandas as pd
 from scipy.optimize import brentq, minimize
 from scipy.signal import lfilter
 from scipy.special import gammaln, xlogy
-from scipy.stats import chi2, norm
+from scipy.stats import chi2, kurtosis, norm, skew
 from scipy.stats import t as student_t
 
 
@@ -350,6 +350,97 @@ def overlap_tstat(x, h):
     return float(x.mean() / se) if se > 1e-15 else 0.0
 
 
+def ols(y, X, hac_lags=0):
+    """최소제곱 회귀 (상수항 자동 추가) + 이분산·자기상관에 강한 t값.
+
+    y: (n,), X: DataFrame 또는 (n, k). hac_lags: 0이면 White(HC1) 표준오차, >0이면 Newey-West(Bartlett) — 일간 수익률처럼
+    변동성이 몰려 다니는 데이터는 보통 t값이 부풀려지므로 이 보정을 쓴다. 결측이 있는 행은 뺀다.
+    반환: dict(coef, t: 이름 붙은 Series — 첫 항목 '알파'가 상수항, r2, n).
+    """
+    names = list(X.columns) if isinstance(X, pd.DataFrame) else [f"x{i}" for i in range(np.shape(X)[1])]
+    Xa = np.column_stack([np.ones(len(y)), np.asarray(X, float)])
+    ya = np.asarray(y, float)
+    ok = np.isfinite(ya) & np.isfinite(Xa).all(axis=1)
+    Xa, ya = Xa[ok], ya[ok]
+    n, k = Xa.shape
+    idx = ["알파", *names]
+    if n <= k + 1:
+        nan = pd.Series(np.nan, index=idx)
+        return {"coef": nan, "t": nan.copy(), "r2": np.nan, "n": int(n)}
+    XtX_inv = np.linalg.pinv(Xa.T @ Xa)
+    b = XtX_inv @ Xa.T @ ya
+    e = ya - Xa @ b
+    u = Xa * e[:, None]
+    S = u.T @ u
+    for lag in range(1, min(int(hac_lags), n - 1) + 1):
+        G = u[lag:].T @ u[:-lag]
+        S += (1 - lag / (hac_lags + 1)) * (G + G.T)
+    V = XtX_inv @ S @ XtX_inv * (n / (n - k))
+    se = np.sqrt(np.maximum(np.diag(V), 0))
+    tss = np.sum((ya - ya.mean()) ** 2)
+    return {"coef": pd.Series(b, index=idx), "t": pd.Series(np.where(se > 0, b / np.where(se > 0, se, 1), np.nan), index=idx),
+            "r2": float(1 - e @ e / tss) if tss > 0 else np.nan, "n": int(n)}
+
+
+_EULER_GAMMA = 0.5772156649015329
+
+
+def deflated_sharpe(returns, trial_sharpes):
+    """Deflated Sharpe Ratio (Bailey·López de Prado 2014) — 여러 설정을 시험해 가장 좋은 것을 골랐을 때 생기는 착시를 보정.
+
+    N개를 시험하면 아무 효과가 없어도 그중 1등의 샤프는 0보다 크게 나온다(SR0 = 우연히 기대되는 1등 샤프).
+    고른 설정의 샤프가 SR0보다 충분히 큰지를, 수익률의 비대칭·두꺼운 꼬리와 표본 길이까지 반영해 확률로 낸다.
+    returns: 고른 설정의 기간별 수익률. trial_sharpes: 시험한 모든 설정의 같은 기간 단위 샤프(고른 것 포함).
+    반환: dict(sr, sr0 (기간 단위), dsr = 진짜 샤프가 0보다 클 확률, n_trials, T). 샤프를 계산할 수 없으면 None.
+    시험한 설정들이 서로 비슷하면(상관이 높으면) 샤프의 흩어짐이 작아 SR0도 작아진다 — 그만큼 보정이 약해진다.
+    """
+    r = np.asarray(returns, float)
+    r = r[np.isfinite(r)]
+    T = len(r)
+    if T < 3 or r.std(ddof=1) <= 0:
+        return None
+    sr = r.mean() / r.std(ddof=1)
+    s = np.asarray(trial_sharpes, float)
+    s = s[np.isfinite(s)]
+    N = max(len(s), 1)
+    sr0 = (np.sqrt(s.var(ddof=1)) * ((1 - _EULER_GAMMA) * norm.ppf(1 - 1 / N) + _EULER_GAMMA * norm.ppf(1 - 1 / (N * np.e)))
+           if N > 1 else 0.0)
+    denom = 1 - skew(r) * sr + (kurtosis(r, fisher=False) - 1) / 4 * sr ** 2
+    dsr = float(norm.cdf((sr - sr0) * np.sqrt(T - 1) / np.sqrt(max(denom, 1e-12))))
+    return {"sr": float(sr), "sr0": float(sr0), "dsr": dsr, "n_trials": int(N), "T": int(T)}
+
+
+FF_LABELS = {"Mkt-RF": "시장", "SMB": "소형주", "HML": "가치", "RMW": "수익성", "CMA": "보수적 투자", "Mom": "모멘텀"}
+
+
+def timing_attribution(daily, ff=None, hac_lags=5):
+    """보유/현금을 오가는 전략(일간)의 수익이 '타이밍 실력'인지 '알려진 요인에 노출된 것'인지 나눈다.
+
+    daily: DataFrame (index = 수익이 실현된 날짜) — pos(보유 비중), strat(전략 로그수익률, 비용 후), asset(종목 로그수익률).
+    ① 종목 자체: 전략 = α + β·종목. β는 평균 노출, α는 '같은 비중으로 계속 들고 있던 것'보다 나은 부분 = 타이밍 실력.
+    ② ff(파마-프렌치 일간 요인)가 있으면 — 미국 종목: 현금은 무위험 금리를 번다고 보고 전략과 단순 보유의 초과수익을
+       5요인 + 모멘텀에 회귀. 전략의 알파가 단순 보유의 알파보다 크면 그 차이가 요인으로 설명되지 않는 타이밍 효과.
+    반환: dict(summary = 분석별 알파(연)·t값·노출·R²·관측일, loadings = 요인별 계수·t값 (ff가 있을 때만)).
+    """
+    d = daily.dropna()
+    s, a = np.expm1(d["strat"]), np.expm1(d["asset"])
+    rows, loads = {}, {}
+    o = ols(s, a.rename("종목").to_frame(), hac_lags)
+    rows["전략 = α + β·종목 (같은 비중 보유와 비교)"] = {"알파(연)": o["coef"]["알파"] * 252, "알파 t값": o["t"]["알파"],
+                                                  "노출(β)": o["coef"]["종목"], "R²": o["r2"], "관측일": o["n"]}
+    if ff is not None:
+        cols = [c for c in FF_LABELS if c in ff]
+        f = ff[cols].reindex(d.index)
+        rf = ff["RF"].reindex(d.index) if "RF" in ff else 0.0
+        for name, y in (("전략 (요인 모형)", s - d["pos"] * rf), ("단순 보유 (요인 모형)", a - rf)):
+            o = ols(y, f.rename(columns=FF_LABELS), hac_lags)
+            rows[name] = {"알파(연)": o["coef"]["알파"] * 252, "알파 t값": o["t"]["알파"], "노출(β)": o["coef"]["시장"],
+                          "R²": o["r2"], "관측일": o["n"]}
+            loads[name] = pd.DataFrame({"계수": o["coef"], "t값": o["t"]}).drop(index="알파")
+    loadings = pd.concat(loads, axis=1) if loads else None
+    return {"summary": pd.DataFrame(rows).T, "loadings": loadings}
+
+
 def _std_quantile(p, nu):
     """분산이 1이 되도록 표준화한 충격 분포의 p 분위수 (t분포 또는 정규)."""
     return float(student_t.ppf(p, nu) * np.sqrt((nu - 2) / nu)) if np.isfinite(nu) else float(norm.ppf(p))
@@ -462,7 +553,8 @@ def vol_signal_backtest(close, iv, vrp=0.0, threshold=0.02, h=21, cost_bps=0.0, 
     out = pd.DataFrame({"garch": f, "iv": sig_dec, "iv_entry": sigma, "iv_index": ivs[ii],
                         "realized": np.sqrt(np.mean(lr[jj[:, None] + np.arange(h)] ** 2, axis=1) * 252),
                         "signal": [logic.generate_signal(a, b) for a, b in zip(f, sig_dec)],
-                        "long": gross / s0, "cost": cost / s0, "premium": premium / s0}, index=dates[ii])
+                        "long": gross / s0, "cost": cost / s0, "premium": premium / s0,
+                        "underlying": paths[:, -1] / s0 - 1}, index=dates[ii])
     out.index.name = "date"
     return out
 
@@ -604,8 +696,32 @@ def short_only_split(bt, h=21, cutoffs=SHORT_CUTOFFS, iv_name="IV", min_rows=24)
     for name, pos in (("고른 규칙", rules[chosen](test)), ("항상 매도", rules["항상 매도"](test)),
                       ("GARCH 신호대로 (사이드바 설정)", test["signal"].astype(float))):
         rows[name], curves[name] = _strategy_stats(pos, test, h)
+    # 앞 기간에서 후보 여럿 중 1등을 골랐으므로, 그 샤프가 '시험 횟수만큼의 운'을 넘는지 (Deflated Sharpe)
+    pos = rules[chosen](train)
+    k = np.sqrt(252 / h)
+    dsr = deflated_sharpe((pos * train["long"] - pos.abs() * train["cost"]).values, cand["앞 기간 샤프"].astype(float) / k)
+    if dsr is not None:
+        dsr.update(sr_ann=dsr["sr"] * k, sr0_ann=dsr["sr0"] * k)
     return {"candidates": cand, "chosen": chosen, "test": pd.DataFrame(rows).T, "curves": pd.DataFrame(curves),
-            "train_period": (train.index[0], train.index[-1]), "test_period": (test.index[0], test.index[-1])}
+            "train_period": (train.index[0], train.index[-1]), "test_period": (test.index[0], test.index[-1]), "dsr": dsr}
+
+
+def market_exposure(bt, h=21):
+    """변동성 매매 손익이 '시장 방향'에 얼마나 묶여 있는지: 거래별 손익 = α + β·(진입~만기 주가 수익률).
+
+    델타헤지를 해도 크게 움직인 달엔 감마 손익이 생긴다. 특히 매도는 폭락 달에 크게 잃으므로,
+    이익이 실은 '시장 급락 위험을 떠안은 대가'인지 본다. 하락 상위 10% 달의 평균 손익도 함께 낸다.
+    """
+    m = bt["underlying"]
+    worst = m <= m.quantile(0.10)
+    rows = {}
+    for name, pos in (("항상 변동성 매도", pd.Series(-1.0, index=bt.index)), ("GARCH 신호대로", bt["signal"].astype(float))):
+        ret = pos * bt["long"] - pos.abs() * bt["cost"]
+        o = ols(ret, m.rename("주가 수익률").to_frame())
+        rows[name] = {"알파(거래당)": o["coef"]["알파"], "알파 t값": o["t"]["알파"], "시장 노출(β)": o["coef"]["주가 수익률"],
+                      "β t값": o["t"]["주가 수익률"], "R²": o["r2"], "하락 상위 10% 달 평균 손익": ret[worst].mean(),
+                      "나머지 달 평균 손익": ret[~worst].mean()}
+    return pd.DataFrame(rows).T
 
 
 def short_only_robustness(grid, rule=None, h=21, iv_name="IV"):

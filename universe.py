@@ -28,7 +28,7 @@ from sklearn.linear_model import Ridge
 
 import alt_data as ad
 import kr_data
-from quant_engine import max_drawdown
+from quant_engine import deflated_sharpe, max_drawdown, ols
 
 UDIR = kr_data.CACHE / "universe"
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -383,6 +383,68 @@ def evaluate(wf, cost_bps=15.0, q=5):
         curves[m] = pd.DataFrame({"상위 20% (비용 후)": (1 + net).cumprod(), "하위 20%": (1 + pd.Series(bot_r, index=dates)).cumprod()})
     curves["_universe"] = (1 + uni).cumprod()
     return pd.DataFrame(rows).T, curves
+
+
+# ---------------- 알려진 요인으로 설명되는가 ----------------
+# 같은 종목 범위에서 직접 만든 요인 (상위 20% − 하위 20%, 동일가중, 리밸런싱 날짜의 순위로 나눔)
+FACTOR_PROXIES = {"mom_12_1": ("모멘텀 (12-1개월)", +1), "vol_63": ("저변동성", -1),
+                  "liq": ("소형주 (거래대금 작음)", -1), "bm": ("가치 (PBR 낮음)", +1)}
+
+
+def _period_returns(curve):
+    """누적 곡선(시작=1 기준) → 기간 수익률."""
+    return curve / curve.shift(1).fillna(1.0) - 1
+
+
+def factor_returns(wf, dates, q=5):
+    """리밸런싱 날짜별 요인 수익률 (그날 순위로 나눈 상위 1/q − 하위 1/q, 체결 기준 h일 수익률)."""
+    ret, univ = np.exp(wf["fwd"]) - 1, wf["universe"]
+    out = {}
+    for c, (label, sign) in FACTOR_PROXIES.items():
+        if c not in wf["R"]:
+            continue
+        vals = []
+        for d in dates:
+            s = wf["R"][c].loc[d].where(univ.loc[d]).dropna()
+            s = s[ret.loc[d].reindex(s.index).notna()]
+            k = len(s) // q
+            vals.append(sign * (ret.loc[d, s.nlargest(k).index].mean() - ret.loc[d, s.nsmallest(k).index].mean())
+                        if k >= 5 else np.nan)
+        out[label] = vals
+    return pd.DataFrame(out, index=dates)
+
+
+def factor_exposure(wf, curves, model="auto", q=5):
+    """상위 20%의 초과수익(비용 후 − 전체 평균)을 시장·알려진 요인에 회귀 → 요인으로 설명되지 않는 부분(알파).
+
+    알파가 0 근처면 '새로운 신호'가 아니라 이미 알려진 효과(모멘텀·저변동성 등)에 기울어진 결과라는 뜻이다.
+    표본은 리밸런싱 횟수(겹치지 않는 h일 수익률)라 작다 — t값을 꼭 함께 본다.
+    """
+    cv = curves[model]
+    net, uni = _period_returns(cv["상위 20% (비용 후)"]), _period_returns(curves["_universe"])
+    F = factor_returns(wf, list(cv.index), q)
+    X = pd.concat([uni.rename("시장 (전체 평균)"), F], axis=1)
+    o = ols(net - uni, X)
+    per_year = 252 / wf["h"]
+    tab = pd.DataFrame({"노출(계수)": o["coef"], "t값": o["t"]}).drop(index="알파")
+    tab["요인 자체 성과(연)"] = X.mean() * per_year
+    return {"alpha": o["coef"]["알파"] * per_year, "alpha_t": o["t"]["알파"], "table": tab, "r2": o["r2"], "n": o["n"]}
+
+
+def selection_check(curves, h):
+    """모델 비교표에서 1등을 고르면 생기는 착시 보정 (Deflated Sharpe): 모델별 기간 초과수익(비용 후 − 전체 평균)의 샤프로."""
+    uni = _period_returns(curves["_universe"])
+    ex = {m: _period_returns(cv["상위 20% (비용 후)"]) - uni for m, cv in curves.items() if m != "_universe"}
+    sr = {m: x.mean() / x.std() if x.std() > 0 else np.nan for m, x in ex.items()}
+    valid = {m: v for m, v in sr.items() if np.isfinite(v)}
+    if not valid:
+        return None
+    best = max(valid, key=valid.get)
+    res = deflated_sharpe(ex[best].values, list(valid.values()))
+    if res is None:
+        return None
+    k = np.sqrt(252 / h)
+    return {**res, "best": best, "sr_ann": res["sr"] * k, "sr0_ann": res["sr0"] * k}
 
 
 def current_picks(panel, wf, k=20):
