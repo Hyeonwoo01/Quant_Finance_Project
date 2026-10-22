@@ -322,20 +322,30 @@ def hedged_straddle_pnl(paths, T, r, sigma, q=0.0, cost_bps=0.0, sigma_path=None
     return cash + shares * S[:, n] + np.abs(S[:, n] - K)
 
 
-def newey_west_tstat(x, lags):
-    """평균이 0인지 검정하는 t값 (Newey-West HAC 표준오차, Bartlett 가중).
+def overlap_tstat(x, h):
+    """하루하루 겹치는 h일 표본(h일 수익률·라벨 등)의 평균이 0인지 검정하는 t값.
 
-    h일 수익률처럼 하루하루 겹치는 표본은 서로 상관돼 있어 보통 표준오차가 너무 작게 나온다 → lags = h − 1.
+    겹침 때문에 생기는 상관은 정확히 h−1일까지라서, 그 자기공분산을 모두 같은 가중으로 더한다 (Hansen-Hodrick).
+    흔히 쓰는 Newey-West(Bartlett 가중, 시차 h−1)는 이 경우 분산을 약 1/3 작게 잡아, 몬테카를로에서
+    '우연인데 유의(|t| > 1.96)'가 목표 5% 대신 10~13% 나왔다 (Hansen-Hodrick은 5~7%).
+    표본이 짧아 분산이 0 이하로 나오면 Newey-West(시차 2h, 항상 0 이상)로 대신한다.
     """
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
-    n = len(x)
+    n, h = len(x), max(int(h), 1)
     if n < 2:
         return 0.0
     e = x - x.mean()
-    s = e @ e / n
-    for lag in range(1, min(int(lags), n - 1) + 1):
-        s += 2 * (1 - lag / (lags + 1)) * (e[lag:] @ e[:-lag]) / n
+
+    def long_run_var(lags, bartlett):
+        s = e @ e / n
+        for k in range(1, min(lags, n - 1) + 1):
+            s += 2 * (1 - k / (lags + 1) if bartlett else 1.0) * (e[k:] @ e[:-k]) / n
+        return s
+
+    s = long_run_var(h - 1, bartlett=False)
+    if s <= 0:
+        s = long_run_var(2 * h, bartlett=True)
     se = np.sqrt(max(s, 0.0) / n)
     return float(x.mean() / se) if se > 1e-15 else 0.0
 

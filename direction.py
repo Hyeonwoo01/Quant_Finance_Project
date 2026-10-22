@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 
 import alt_data
 import market_data
-from quant_engine import max_drawdown, newey_west_tstat
+from quant_engine import max_drawdown, overlap_tstat
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
@@ -291,8 +291,8 @@ def score(prob, fwd, h):
     hit = float(correct.mean())
     n_eff = max(len(p) / h, 1.0)                     # h일 수익률이 겹치므로 실질 독립 표본 수 (대략)
     # z: 날마다 (모델 적중 − '항상 오른다' 적중)의 평균이 0보다 큰가. h일 라벨이 겹쳐 서로 상관되므로
-    # Newey-West(HAC) 표준오차를 쓴다 (lag = h − 1). 모델이 늘 '오른다'고 하면 차이가 0이라 z = 0.
-    z = newey_west_tstat(correct - up, h - 1)
+    # 겹침을 반영한 표준오차(Hansen-Hodrick)를 쓴다. 모델이 늘 '오른다'고 하면 차이가 0이라 z = 0.
+    z = overlap_tstat(correct - up, h)
     brier = float(np.mean((p - up) ** 2))
     brier_base = float(np.mean((base - up) ** 2))
     try:

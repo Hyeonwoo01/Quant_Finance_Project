@@ -87,14 +87,18 @@ for _lag in (0, 1):
                        (_pos * _r.shift(-(1 + _lag)).reindex(wf_a.index).fillna(0.0)).values[1:])
     assert _e["z"] == ev["z"] and _e["skill"] == ev["skill"]          # 예측 채점은 체결 시점과 무관
 
-# Newey-West t값: 겹침이 없으면 보통 t값과 같고, 21일씩 겹친 합이면 크게 줄어야 한다
-from quant_engine import newey_west_tstat
+# 겹침 보정 t값: 겹침이 없으면(h=1) 보통 t값과 같고, 21일씩 겹친 합이면 크게 줄어야 한다
+from quant_engine import overlap_tstat
 _g = np.random.default_rng(3)
 _iid = _g.standard_normal(5000) + 0.05
-assert abs(newey_west_tstat(_iid, 0) - _iid.mean() / _iid.std() * np.sqrt(5000)) < 1e-9
+assert abs(overlap_tstat(_iid, 1) - _iid.mean() / _iid.std() * np.sqrt(5000)) < 1e-9
 _ov = np.convolve(_g.standard_normal(5020) + 0.05, np.ones(21), "valid")
-assert abs(newey_west_tstat(_ov, 20)) < abs(_ov.mean() / _ov.std() * np.sqrt(len(_ov))) / 2
-assert newey_west_tstat(np.zeros(100), 5) == 0.0
+assert abs(overlap_tstat(_ov, 21)) < abs(_ov.mean() / _ov.std() * np.sqrt(len(_ov))) / 2
+assert overlap_tstat(np.zeros(100), 5) == 0.0
+# 효과가 없을 때 '우연인데 유의(|t| > 1.96)' 비율이 목표 5% 근처여야 한다 (Newey-West 시차 20이면 약 11%)
+_rej = np.mean([abs(overlap_tstat(np.convolve(_g.standard_normal(2520), np.ones(21), "valid")[:2500], 21)) > 1.96
+                for _ in range(1000)])
+assert 0.025 < _rej < 0.08, _rej
 
 # 파이프라인이 '실제로 예측 가능한' 데이터에선 신호를 찾아내는지 (모멘텀이 있는 합성 가격)
 r = np.zeros(2500)
