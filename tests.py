@@ -140,6 +140,9 @@ wl, _ = dr.walk_forward(px, 21, light=True)
 assert "gbm" not in wl and "ensemble" not in wl and np.allclose(wl["logit_price"], wf_a["logit_price"])   # 가벼운 점검도 같은 로지스틱
 hz = dr.horizon_check(px_m, horizons=(5, 21))                  # 가벼운 점검(로지스틱)도 심어 둔 신호를 잡아야
 assert list(hz.index) == ["5거래일", "21거래일"] and hz.loc["5거래일", "확률 정확도 개선"] > 0
+assert "부스팅·앙상블 선택 비율" not in hz
+hzf = dr.horizon_check(px_m, horizons=(21,), light=False, refit_every=252)        # 부스팅 포함: 선택 비율 열이 붙어야
+assert 0 <= hzf.loc["21거래일", "부스팅·앙상블 선택 비율"] <= 1
 
 # DART 공시: 분류 + '접수일 다음 거래일'부터 반영되는지 (네트워크 없이 공시 목록을 가짜로 주입)
 import kr_data

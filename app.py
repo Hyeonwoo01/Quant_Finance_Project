@@ -83,6 +83,18 @@ def get_direction_horizons(ticker, cost_bps):
     return dr.horizon_check(close, macro, alt, ticker, cost_bps)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_direction_horizons_full(ticker, cost_bps):
+    """부스팅까지 포함한 예측 기간 점검 — 무거워서 1년마다 재학습.
+
+    같은 1년 주기로 '로지스틱만' 점검도 함께 돌려, 두 결과의 차이가 부스팅 때문인지만 비교되게 한다.
+    """
+    close, macro, alt, _ = get_direction_inputs(ticker)
+    full = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=False, refit_every=252)
+    light = dr.horizon_check(close, macro, alt, ticker, cost_bps, light=True, refit_every=252)
+    return full, light
+
+
 def _signed(digits=2):
     """부호 붙인 숫자. 반올림해서 0이면 부호 없이 — 아주 작은 음수가 '-0.00'으로 보이지 않게."""
     return lambda v: "—" if pd.isna(v) else f"{0:.{digits}f}" if round(v, digits) == 0 else f"{v:+.{digits}f}"
@@ -98,11 +110,11 @@ def signed_table(df, digits=2):
 def robust_table(df):
     """방향 예측 점검 표 (검증 통과는 글자로)."""
     d = df.assign(**{"검증 통과": df["검증 통과"].map({True: "통과", False: "—"})})
-    first = [c for c in ("가장 많이 고른 모델",) if c in d]
+    first = [c for c in ("가장 많이 고른 모델", "부스팅·앙상블 선택 비율") if c in d]
     d = d[first + [c for c in d.columns if c not in first]]
     st.dataframe(d.style.format({"적중률": "{:.1%}", "'항상 오른다' 대비": "{:+.1%}", "확률 정확도 개선": "{:+.1%}",
                                  "z": _signed(1), "전략 샤프": "{:.2f}", "단순 보유 샤프": "{:.2f}", "전략 최대 낙폭": "{:.0%}",
-                                 "보유 비중": "{:.0%}"}, na_rep="—"), width="stretch",
+                                 "보유 비중": "{:.0%}", "부스팅·앙상블 선택 비율": "{:.0%}"}, na_rep="—"), width="stretch",
                  column_config={"검증 통과": st.column_config.TextColumn("검증 통과", alignment="center")})
 
 
@@ -473,6 +485,26 @@ with tab_dir:
                                f"위 결과에서 부스팅·앙상블이 골라진 비율은 {gbm_share:.0%}"
                                + ("라서 이 점검과 결론이 크게 다르지 않습니다." if gbm_share < 0.2 else
                                   "로 높아서, 이 점검은 그 모델의 성적을 반영하지 못합니다."))
+                except Exception as e:
+                    st.error(f"계산 실패: {e}")
+
+            st.markdown("**④-2 부스팅까지 포함해 점검** — 기간이 길수록 비선형 모델이 나을 수 있는지 확인 (무겁습니다)")
+            if st.button("부스팅까지 포함해 점검", key="dir_h_check_full"):
+                try:
+                    with st.spinner("모든 후보로 예측 기간 5가지를 다시 학습하는 중… (무료 서버에서는 몇 분 걸릴 수 있습니다)"):
+                        HF, HL = get_direction_horizons_full(ticker, cost_bps)
+                    robust_table(HF)
+                    cmp = pd.DataFrame({"로지스틱만": HL["확률 정확도 개선"], "부스팅 포함": HF["확률 정확도 개선"]}).astype(float)
+                    cmp["차이 (부스팅 포함 − 로지스틱만)"] = cmp["부스팅 포함"] - cmp["로지스틱만"]
+                    st.markdown("확률 정확도 개선 비교 — 같은 조건(1년마다 재학습)에서 부스팅·앙상블 후보만 넣고 뺀 차이")
+                    st.dataframe(cmp.style.format({"로지스틱만": "{:+.1%}", "부스팅 포함": "{:+.1%}"}).format(
+                        lambda v: "0.0%p" if round(v * 100, 1) == 0 else f"{v * 100:+.1f}%p",
+                        subset=["차이 (부스팅 포함 − 로지스틱만)"]).map(
+                        lambda v: f"color: {ui.APPROVE}" if round(v * 100, 1) > 0 else f"color: {ui.REJECT}" if round(v * 100, 1) < 0 else "",
+                        subset=["차이 (부스팅 포함 − 로지스틱만)"]), width="stretch")
+                    st.caption(f"검증 통과 {int(HF['검증 통과'].sum())} / {len(HF)}. 무거워서 1년(252거래일)마다 재학습했고, 비교용 '로지스틱만'도 "
+                               "같은 주기로 돌렸습니다. 차이가 +이고 긴 기간(42·63일)에서 커지면 부스팅이 긴 기간에 도움이 된다는 신호지만, "
+                               "63일 예측은 10년치라도 서로 독립적인 표본이 30개 안팎이라 z가 2를 넘기 어렵습니다 — 검증 통과 여부를 꼭 함께 보세요.")
                 except Exception as e:
                     st.error(f"계산 실패: {e}")
 

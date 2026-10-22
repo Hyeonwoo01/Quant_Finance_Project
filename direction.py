@@ -381,7 +381,7 @@ def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizo
     """예측 기간을 바꿔 워크포워드를 처음부터 다시 돌린다.
 
     light=True(기본): 무거운 부스팅·앙상블을 빼고 기본 확률·로지스틱 후보만 — 무료 서버에서도 1분 안팎.
-    재학습 주기(refit_every)는 본 화면과 같게 둔다.
+    light=False: 모든 후보 (부스팅이 골라진 비율 열 추가). 무거우므로 refit_every를 길게(예: 252) 잡아 쓴다.
     """
     r = np.log(close).diff()
     rows = {}
@@ -390,6 +390,8 @@ def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizo
         if wf.empty:
             continue
         rows[f"{h}거래일"] = _robust_row(evaluate(wf, h, r, cost_bps))
+        if not light:          # 부스팅이 실제로 골라졌는지 — 0%면 부스팅을 넣어도 결과가 같다
+            rows[f"{h}거래일"]["부스팅·앙상블 선택 비율"] = float(wf["chosen"].isin(["gbm", "ensemble"]).mean())
     return pd.DataFrame(rows).T
 
 
