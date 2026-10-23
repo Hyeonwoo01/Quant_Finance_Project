@@ -46,7 +46,7 @@ def drop_unfinished(close, ticker, now=None):
     """마지막 봉이 '오늘'이고 그 거래소가 아직 마감 전(여유 포함)이면 빼고 돌려준다.
 
     수동 실행이나 예약 시각이 장중에 걸려도, 끝나지 않은 가격으로 예측을 기록하지 않도록."""
-    tz, cutoff = _SESSIONS["US" if md.is_us_ticker(ticker) else "KR"]
+    tz, cutoff = _SESSIONS["US" if md.is_us_ticker(ticker) else "KR"]          # ^KS11 같은 한국 지수는 한국 장
     local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz))
     if close.index[-1].date() == local.date() and local.hour * 60 + local.minute < cutoff:
         return close.iloc[:-1]

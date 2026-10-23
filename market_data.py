@@ -143,6 +143,9 @@ def search_ticker(query, limit=10):
 
 
 def is_us_ticker(ticker):
+    """미국 등 해외 티커인지. 한국 지수(^KS11 코스피, ^KQ11 코스닥, ^KS200)는 점이 없어도 한국으로 본다."""
+    if ticker.upper().startswith(("^KS", "^KQ")):
+        return False
     return "." not in ticker or ticker.endswith(".US")
 
 

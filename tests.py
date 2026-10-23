@@ -231,6 +231,7 @@ assert wf_u["exec_lag"] == 1 and np.allclose(wf_u["scores"]["ridge"].values, wf_
 assert dr.resolve_lag(None, "005930.KS") and dr.resolve_lag(None, "247540.KQ")
 assert not dr.resolve_lag(None, "AAPL") and not dr.resolve_lag(None, "SPY")
 assert dr.resolve_lag(None, None) and not dr.resolve_lag(False, "005930.KS")
+assert dr.resolve_lag(None, "^KS11") and dr.resolve_lag(None, "^KQ11") and not dr.resolve_lag(None, "^GSPC")   # 한국 지수도 하루 늦춤
 mi = pd.bdate_range("2019-01-01", periods=700)
 g2 = np.random.default_rng(11)
 macro_t = pd.DataFrame({k: 50 + np.cumsum(g2.normal(0, 1, len(mi))) for k in
@@ -569,6 +570,7 @@ assert len(fl.drop_unfinished(_kd, "005930.KS", _utc("2026-10-23T01:00"))) == 1 
 assert len(fl.drop_unfinished(_kd, "005930.KS", _utc("2026-10-23T08:37"))) == 2      # 한국 오후 5:37 → 그대로
 assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-23T16:00"))) == 1            # 뉴욕 정오 = 장중 → 뺌
 assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-24T08:37"))) == 2            # 다음 날 새벽 → 그대로
+assert len(fl.drop_unfinished(_kd, "^KS11", _utc("2026-10-23T01:00"))) == 1          # 코스피 지수도 한국 장 기준
 # Cboe 변동성 지수 CSV (Yahoo에 없는 RVX 등)
 _cb = md.parse_cboe_csv("DATE,OPEN,HIGH,LOW,CLOSE\n10/21/2026,20.1,21.0,19.5,20.5\n10/22/2026,20.5,22.0,20.0,21.25\n")
 assert list(_cb.index.strftime("%Y-%m-%d")) == ["2026-10-21", "2026-10-22"] and _cb.iloc[-1] == 21.25
