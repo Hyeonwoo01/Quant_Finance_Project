@@ -107,8 +107,15 @@ def _signed(digits=2):
 def signed_table(df, digits=2):
     """+/− 차이 표: +는 초록, −는 빨강, 반올림해서 0이면 색 없음."""
     d = df.astype(float).round(digits) + 0.0
-    st.dataframe(d.style.format(_signed(digits)).map(
-        lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""), width="stretch")
+    color = lambda v: f"color: {ui.APPROVE}" if v > 0 else f"color: {ui.REJECT}" if v < 0 else ""
+    if not d.isna().any().any():
+        st.dataframe(d.style.format(_signed(digits)).map(color), width="stretch")
+        return
+    # 빈 칸이 있으면 글자로 바꿔 '—'로 보이게 (Streamlit은 숫자 열의 결측을 None으로 표시한다)
+    styles = d.map(color)
+    txt = d.map(_signed(digits))
+    st.dataframe(txt.style.apply(lambda _: styles, axis=None), width="stretch",
+                 column_config={c: st.column_config.TextColumn(str(c), alignment="right") for c in txt.columns})
 
 
 def robust_table(df):
@@ -812,7 +819,8 @@ with tab_snap:
                                     "title": "헤드라인", "source": "언론사",
                                     "link": st.column_config.LinkColumn("링크", display_text="열기")})
         st.caption("감성 점수는 제목에 나온 긍정·부정 단어를 세는 단순한 방식이라, 반어나 맥락은 이해하지 못합니다. "
-                   "과거 뉴스 기록을 무료로 구할 수 없어 예측에 도움이 되는지는 확인하지 못했습니다.")
+                   "과거 뉴스 기록을 무료로 구할 수 없어 예측에 도움이 되는지는 아직 확인하지 못했습니다. 그래서 기록 대상 종목은 "
+                   "이 탭의 옵션·전망·뉴스 지표를 매일 저장해 두고, '예측 정확도 검증' 탭의 실전 기록에서 채점합니다.")
 
 # ---------------- 2. 변동성 ----------------
 with tab2:
@@ -1165,6 +1173,16 @@ with tab4:
                        "결론을 내리려면 적어도 몇 달, 가능하면 1년 이상 쌓여야 합니다.")
         else:
             st.caption("아직 21거래일이 지난 기록이 없어 방향·범위·변동성은 채점 전입니다.")
+        sc_tab = fs.get("시장 심리 지표")
+        if sc_tab is not None and sc_tab["표본"].sum() > 0:
+            st.markdown("**시장 심리 지표는 쓸모가 있을까?** — 기록해 둔 지표와 그 뒤 21거래일 수익률·실제 변동성의 관계")
+            sc_show = pd.DataFrame({c: sc_tab[c].map(lambda v: f"{v:.0f}") if c == "표본" else sc_tab[c].map(_signed(2 if "상관" in c else 1))
+                                    for c in sc_tab.columns})          # 빈 칸을 '—'로 (숫자 열의 결측은 None으로 보임)
+            st.dataframe(sc_show, width="stretch",
+                         column_config={c: st.column_config.TextColumn(c, alignment="right") for c in sc_show.columns})
+            st.caption("과거 기록을 무료로 구할 수 없어 매일 적어 두고 있는 지표들입니다. 기록한 다음 거래일 종가부터 잰 수익률과 비교해서, "
+                       "기록 뒤 밤사이 뉴스로 생긴 가격 차이는 빼고 채점합니다. 기록이 매일 겹치므로 겹침을 보정한 t값이 2를 넘어야 우연이 "
+                       "아니라고 봅니다. 표본이 10개 미만이면 계산하지 않고, 결론에는 몇 달 이상 필요합니다.")
         if "하루 VaR 95%" in fs:
             v95, v99 = fs["하루 VaR 95%"], fs["하루 VaR 99%"]
             st.caption(f"하루 VaR 예외 (다음 날 손실이 VaR보다 컸던 날): 95% {v95['예외 횟수']}번 / {v95['관측일']}일 (목표 5%), "

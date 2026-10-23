@@ -23,15 +23,19 @@ import alt_data as ad
 import direction as dr
 import market_data as md
 import regime as rg
-from quant_engine import GarchVolForecaster, overlap_tstat, var_es, var_exception_tests
+from quant_engine import GarchVolForecaster, ols, overlap_tstat, var_es, var_exception_tests
 
 LOG_DIR = Path(__file__).parent / "forecast_log"
 LOG_PATH = LOG_DIR / "log.csv"
 TICKERS_PATH = LOG_DIR / "tickers.txt"
 H = 21                    # 모든 예측의 기간 (거래일, ≈ 1개월)
 GARCH_YEARS = 3           # 앱 기본 '학습 데이터' 설정과 같게
+# 시장 심리 지표 (앱 '시장 심리' 탭과 같은 값). 과거 기록을 무료로 구할 수 없어 지금 적어 두어야 나중에 검증할 수 있다.
+SENTIMENT = {"pc_volume": "풋/콜 거래량 비율", "pc_oi": "풋/콜 미결제약정 비율", "skew": "옵션 스큐 (풋 90% − 콜 110% IV)",
+             "eps_rev_30d": "올해 EPS 전망 30일 변화", "news_7d": "뉴스 감성 (최근 7일 평균)"}
 COLUMNS = ["asof", "ticker", "close", "h", "p_up", "p_base", "model", "vol_garch", "lo95", "lo68", "hi68", "hi95",
-           "var95_1d", "var99_1d", "garch_ok", "iv_atm", "iv_days", "vol_index", "p_high", "version", "logged_at"]
+           "var95_1d", "var99_1d", "garch_ok", "iv_atm", "iv_days", "vol_index", "p_high",
+           *SENTIMENT, "news_n", "version", "logged_at"]
 
 
 # 거래소별 (시간대, 장 마감 시각 + 여유 분). 그 전에 돌리면 오늘 봉은 아직 움직이는 중이라 쓰지 않는다.
@@ -88,12 +92,15 @@ def predict(ticker, h=H, have=frozenset()):
     # 시장 기대 변동성: 지금 옵션의 ATM IV(약 1개월 만기)와, 있으면 변동성 지수(SPY → VIX 등)
     try:
         r, _ = md.risk_free_rate(ticker)
-        opt = md.atm_implied_vol(ticker, spot, round(h * 365 / 252), r, md.dividend_yield(ticker, spot))
+        q = md.dividend_yield(ticker, spot)
+        opt = md.atm_implied_vol(ticker, spot, round(h * 365 / 252), r, q)
     except Exception:
-        opt = None
+        r, q, opt = 0.04, 0.0, None
     row.update(iv_atm=opt["iv"] if opt else np.nan, iv_days=opt["cal_days"] if opt else np.nan)
     vi = md.load_vol_index(ticker, 1)
     row["vol_index"] = float(vi.loc[:asof].iloc[-1]) if vi is not None and len(vi.loc[:asof]) else np.nan
+
+    row.update(sentiment(ticker, spot, r, q))
 
     # 시장 국면: 앱과 같이 최대 10년치 전체로 추정한 지금의 불안 국면 확률
     rr = np.log(close).diff().dropna().values
@@ -101,6 +108,31 @@ def predict(ticker, h=H, have=frozenset()):
     row["version"] = os.environ.get("GITHUB_SHA", "")[:7]
     row["logged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     return row
+
+
+def sentiment(ticker, spot, r, q):
+    """앱 '시장 심리' 탭과 같은 지표. 받지 못한 것은 결측(한국 종목은 옵션·EPS 전망이 보통 없음)."""
+    out = dict.fromkeys([*SENTIMENT, "news_n"], np.nan)
+    try:
+        o = ad.options_snapshot(ticker, spot, r, q)
+        if o:
+            out.update(pc_volume=o["pc_volume"], pc_oi=o["pc_oi"], skew=o["skew"])
+    except Exception:
+        pass
+    try:
+        rv = ad.estimate_revisions(ticker)
+        if rv is not None and "30일 전 대비" in rv and "올해" in rv.index:
+            out["eps_rev_30d"] = float(rv.loc["올해", "30일 전 대비"])
+    except Exception:
+        pass
+    try:
+        nw = ad.news_sentiment(ticker)
+        if nw is not None and len(nw):
+            recent = nw[nw["time"] >= nw["time"].max() - pd.Timedelta(days=7)]
+            out.update(news_7d=float(recent["score"].mean()), news_n=len(recent))
+    except Exception:
+        pass
+    return out
 
 
 def _predict_retry(ticker, tries=3, wait=30, have=frozenset()):
@@ -151,7 +183,8 @@ def score(log, close):
         if i < 0:
             continue
         h = int(r["h"])
-        out = {"asof": r["asof"], "p_up": r["p_up"], "p_base": r["p_base"], "model": r["model"], "p_high": r["p_high"]}
+        out = {"asof": r["asof"], "p_up": r["p_up"], "p_base": r["p_base"], "model": r["model"], "p_high": r["p_high"],
+               **{c: r.get(c, np.nan) for c in SENTIMENT}}
         if i + 1 < len(px):
             r1 = px[i + 1] / px[i] - 1
             out.update(ret_1d=r1, exc95=float(r1 < -r["var95_1d"]), exc99=float(r1 < -r["var99_1d"]))
@@ -162,6 +195,8 @@ def score(log, close):
                        vol_garch=r["vol_garch"], iv_atm=r["iv_atm"], vol_index=r["vol_index"],
                        in68=float(r["lo68"] / r["close"] <= g <= r["hi68"] / r["close"]),
                        in95=float(r["lo95"] / r["close"] <= g <= r["hi95"] / r["close"]))
+        if i + 1 + h < len(px):           # 지표 채점용: 기록 다음 거래일 종가부터 (기록 뒤 밤사이 뉴스로 생긴 갭은 뺌)
+            out.update(ret_next=px[i + 1 + h] / px[i + 1] - 1, rv_next=np.sqrt(np.mean(lr[i + 1:i + 1 + h] ** 2) * 252))
         rows.append(out)
     rows = pd.DataFrame(rows)
     s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max()}
@@ -185,7 +220,24 @@ def score(log, close):
         s.update({"GARCH 오차": rmse("vol_garch"), "옵션 IV 오차": rmse("iv_atm"), "변동성 지수 오차": rmse("vol_index"),
                   "불안 국면일 때 실제 변동성": float(done.loc[done["p_high"] >= 0.5, "rv"].mean()),
                   "안정 국면일 때 실제 변동성": float(done.loc[done["p_high"] < 0.5, "rv"].mean())})
+    s["시장 심리 지표"] = sentiment_check(rows, int(log["h"].iloc[0]))
     return {"rows": rows, "summary": s}
+
+
+def sentiment_check(rows, h, min_n=10):
+    """시장 심리 지표가 '다음 거래일부터 h일' 수익률·실제 변동성과 관련이 있는지 (기록이 매일 겹치므로 겹침 보정 t값)."""
+    out = {}
+    for c, label in SENTIMENT.items():
+        d = rows[[c, "ret_next", "rv_next"]].dropna() if {c, "ret_next"} <= set(rows) else pd.DataFrame()
+        row = {"표본": len(d)}
+        if len(d) >= min_n and d[c].std() > 0:
+            for y, name in (("ret_next", "수익률"), ("rv_next", "변동성")):
+                o = ols(d[y], d[[c]], hac_lags=h - 1)
+                row[f"{name}과 상관"] = float(np.corrcoef(d[c], d[y])[0, 1])
+                row[f"{name} t값"] = float(o["t"][c])
+        out[label] = row
+    cols = ["표본", "수익률과 상관", "수익률 t값", "변동성과 상관", "변동성 t값"]
+    return pd.DataFrame(out).T.reindex(columns=cols).astype(float)          # 숫자 열로 (object 열의 결측은 화면에 None으로 보임)
 
 
 def check():
