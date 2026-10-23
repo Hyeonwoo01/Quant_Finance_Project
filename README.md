@@ -43,7 +43,8 @@ python -m venv .venv
 ### 실전 기록 (앞으로의 예측)
 
 과거 검증은 결과를 이미 아는 데이터로 하므로 가정을 나중에 고를 여지가 남습니다. 그래서 GitHub Actions(`forecast-log`)가 평일마다
-미국 장 마감 후(UTC 22:37, 한국 시간 다음 날 오전 7:37) 그날의 예측을 `forecast_log/log.csv`에 **추가만** 하고 커밋합니다.
+한국 시간 오후 5:37(UTC 08:37)에 그날의 예측을 `forecast_log/log.csv`에 **추가만** 하고 커밋합니다 (한국 종목은 그날 종가, 미국 종목은 전날 종가 기준 —
+두 시장 종가가 모두 확정된 시각. 끝나지 않은 장중 가격은 쓰지 않습니다).
 앱의 '예측 정확도 검증' 탭이 21거래일 뒤 실제 결과로 채점합니다 (방향·확률 정확도, 68%/95% 범위, GARCH vs 옵션 IV·변동성 지수 오차, 하루 VaR 예외).
 
 - **기록 종목:** `forecast_log/tickers.txt` (미국 지수 ETF·대형주 위주 + 한국 2종목). 한 줄 추가하면 다음 기록부터 포함됩니다.
@@ -79,7 +80,7 @@ python -m venv .venv
 | `regime.py` | 2상태 국면 전환 모델(EM 추정, 필터 확률), 워크포워드 국면 확률과 전략 평가 |
 | `direction.py` | 단일 종목 방향 예측 + 워크포워드 자동 선택 + 가정 바꿔 점검 |
 | `universe.py` | 코스피 종목 고르기 (데이터 수집, 특징 패널, 워크포워드, 평가) |
-| `market_data.py`, `alt_data.py`, `kr_data.py` | Yahoo·네이버·DART·ECOS 데이터, 미국 요인 수익률(Kenneth French 데이터 라이브러리) |
+| `market_data.py`, `alt_data.py`, `kr_data.py` | Yahoo·네이버·DART·ECOS 데이터, 미국 요인 수익률(Kenneth French 데이터 라이브러리), Yahoo에 없는 변동성 지수(RVX 등)는 Cboe 공식 CSV |
 | `ui.py`, `.streamlit/config.toml` | 디자인 시스템 (Apple 기반: Parchment 바탕·흰 카드·Action Blue 하나·Pretendard) |
 | `tests.py` | 가격·IV·GARCH(t분포·추정 실패 대체 포함) 검증, VaR·MDD·VaR 예외 검정, 겹침 보정 t값·Deflated Sharpe(보정이 맞는지 몬테카를로로 확인), 요인 분해, 실전 기록·채점, 체결 시점, 미래 정보 누출 테스트(방향·종목·변동성 신호·국면) 등 (`python tests.py`) |
 | `forecast_log.py`, `forecast_log/` | 실전 기록: 오늘의 예측 계산·추가(`python forecast_log.py record`), 채점, 데이터 연결 점검(`check`). 종목 목록 `tickers.txt`, 기록 `log.csv` |
