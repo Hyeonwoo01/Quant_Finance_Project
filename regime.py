@@ -125,7 +125,9 @@ def evaluate(p_high, r, cost_bps=0.0, threshold=0.5, lag=1):
 
     table = pd.DataFrame({"불안 국면엔 현금": stats(strat, equity["불안 국면엔 현금"]),
                           "단순 보유": stats(nxt, equity["단순 보유"])}).T
-    return {"table": table, "equity": equity, "time_in_market": float(pos.mean()),
+    paid = pd.Series(r.index, index=r.index).shift(-(1 + lag)).reindex(pos.index)       # 수익이 실현된 날짜
+    daily = pd.DataFrame({"pos": pos.values, "strat": strat.values, "asset": nxt.values}, index=paid.values)[paid.notna().values]
+    return {"table": table, "equity": equity, "daily": daily, "time_in_market": float(pos.mean()),
             "switches": int(turnover.iloc[1:].sum())}
 
 

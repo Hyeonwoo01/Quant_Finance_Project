@@ -1,0 +1,196 @@
+"""앞으로의 예측 기록 (실전 검증): 매일 장 마감 후 그날의 예측을 적어 두고, 결과가 나오면 채점한다.
+
+백테스트는 결과를 이미 아는 과거로 시험하므로 가정·모델을 나중에 고를 여지가 남는다. 여기서는 예측을 먼저 기록하고
+결과는 나중에 보므로 그럴 수가 없다 = 진짜 표본 밖 검증. 기록은 덮어쓰지 않고 추가만 한다.
+
+기록은 GitHub Actions(.github/workflows/forecast-log.yml)가 평일마다 돌려 forecast_log/log.csv에 커밋한다.
+기록할 종목은 forecast_log/tickers.txt (한 줄에 하나).
+
+명령줄:  python forecast_log.py record   (오늘 예측을 기록에 추가)
+         python forecast_log.py check    (저장하지 않고 두 종목만 계산해 출력 — 데이터 연결 점검)
+"""
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import alt_data as ad
+import direction as dr
+import market_data as md
+import regime as rg
+from quant_engine import GarchVolForecaster, overlap_tstat, var_es, var_exception_tests
+
+LOG_DIR = Path(__file__).parent / "forecast_log"
+LOG_PATH = LOG_DIR / "log.csv"
+TICKERS_PATH = LOG_DIR / "tickers.txt"
+H = 21                    # 모든 예측의 기간 (거래일, ≈ 1개월)
+GARCH_YEARS = 3           # 앱 기본 '학습 데이터' 설정과 같게
+COLUMNS = ["asof", "ticker", "close", "h", "p_up", "p_base", "model", "vol_garch", "lo95", "lo68", "hi68", "hi95",
+           "var95_1d", "var99_1d", "garch_ok", "iv_atm", "iv_days", "vol_index", "p_high", "version", "logged_at"]
+
+
+def tickers(path=TICKERS_PATH):
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    return [s.split("#")[0].strip() for s in lines if s.split("#")[0].strip()]
+
+
+def read_log(path=LOG_PATH):
+    if not Path(path).exists():
+        return pd.DataFrame(columns=COLUMNS)
+    log = pd.read_csv(path, dtype={"ticker": str, "model": str, "version": str})
+    log["asof"] = pd.to_datetime(log["asof"])
+    return log
+
+
+def predict(ticker, h=H, have=frozenset()):
+    """앱 기본 설정과 같은 계산으로 오늘(마지막 종가 기준)의 예측 한 줄. 그 날짜가 이미 기록돼 있으면(휴장일 등) skip 표시만."""
+    close = md.load_history(ticker, 10)
+    asof, spot = close.index[-1], float(close.iloc[-1])
+    row = {"asof": asof.date().isoformat(), "ticker": ticker, "close": spot, "h": h}
+    if (row["asof"], ticker) in have:
+        return {**row, "skip": True}
+
+    # 방향: 앱 get_direction과 같은 입력(최대 10년 종가 + 거시 + 대체 데이터)과 같은 자동 선택
+    macro = md.load_macro(ticker)
+    alt, _ = ad.build_alt_features(ticker, close.index)
+    wf, _ = dr.walk_forward(close, h, macro, alt=alt, ticker=ticker)
+    p_up, pick, now_all, _, _ = dr.predict_now(close, h, wf, macro, alt=alt, ticker=ticker)
+    row.update(p_up=p_up, p_base=now_all.get("base", np.nan), model=pick)
+
+    # 변동성·가격 범위·하루 VaR: 앱 '주가 예측 범위' 탭과 같은 t분포 GARCH 시뮬레이션 (학습 3년)
+    c3 = close[close.index > asof - pd.DateOffset(years=GARCH_YEARS)]
+    g = GarchVolForecaster().fit(np.log(c3).diff().dropna().values)
+    sims = g.simulate(h)
+    q = spot * np.exp(np.quantile(sims[:, -1], [0.025, 0.16, 0.84, 0.975]))
+    row.update(vol_garch=g.forecast_vol(h), lo95=q[0], lo68=q[1], hi68=q[2], hi95=q[3],
+               var95_1d=var_es(sims[:, 0], 0.95)[0], var99_1d=var_es(sims[:, 0], 0.99)[0], garch_ok=bool(g.converged))
+
+    # 시장 기대 변동성: 지금 옵션의 ATM IV(약 1개월 만기)와, 있으면 변동성 지수(SPY → VIX 등)
+    try:
+        r, _ = md.risk_free_rate(ticker)
+        opt = md.atm_implied_vol(ticker, spot, round(h * 365 / 252), r, md.dividend_yield(ticker, spot))
+    except Exception:
+        opt = None
+    row.update(iv_atm=opt["iv"] if opt else np.nan, iv_days=opt["cal_days"] if opt else np.nan)
+    vi = md.load_vol_index(ticker, 1)
+    row["vol_index"] = float(vi.loc[:asof].iloc[-1]) if vi is not None and len(vi.loc[:asof]) else np.nan
+
+    # 시장 국면: 앱과 같이 최대 10년치 전체로 추정한 지금의 불안 국면 확률
+    rr = np.log(close).diff().dropna().values
+    row["p_high"] = float(rg.RegimeSwitchingModel().fit(rr).filter(rr)[-1])
+    row["version"] = os.environ.get("GITHUB_SHA", "")[:7]
+    row["logged_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    return row
+
+
+def _predict_retry(ticker, tries=3, wait=30, have=frozenset()):
+    for k in range(tries):
+        try:
+            return predict(ticker, have=have)
+        except Exception as e:                       # 무료 데이터는 가끔 막히거나 비어 온다 → 잠시 뒤 다시
+            print(f"{ticker}: 실패 ({k + 1}/{tries}) {type(e).__name__}: {e}", flush=True)
+            if k + 1 < tries:
+                time.sleep(wait)
+    return None
+
+
+def record(path=LOG_PATH, names=None):
+    """오늘 예측을 기록에 추가 (같은 날짜·종목이 이미 있으면 건너뜀 — 먼저 적은 예측을 고치지 않는다)."""
+    log = read_log(path)
+    have = set(zip(pd.to_datetime(log["asof"]).dt.strftime("%Y-%m-%d"), log["ticker"])) if len(log) else set()
+    new, failed = [], []
+    for t in names or tickers():
+        row = _predict_retry(t, have=have)
+        if row is None:
+            failed.append(t)
+        elif row.get("skip"):
+            print(f"{t}: {row['asof']} 기록이 이미 있음 (휴장일 등) — 건너뜀", flush=True)
+        else:
+            new.append(row)
+            print(f"{t}: {row['asof']} 상승 확률 {row['p_up']:.1%} ({row['model']}), GARCH {row['vol_garch']:.1%}", flush=True)
+    if new:
+        out = pd.concat([log, pd.DataFrame(new)], ignore_index=True)[COLUMNS] if len(log) else pd.DataFrame(new)[COLUMNS]
+        out["asof"] = pd.to_datetime(out["asof"]).dt.strftime("%Y-%m-%d")
+        Path(path).parent.mkdir(exist_ok=True)
+        out.to_csv(path, index=False, float_format="%.8g")
+    return new, failed
+
+
+def score(log, close):
+    """한 종목의 기록을 실제 종가로 채점. close: 그 종목의 (수정)종가 — 기록 기간과 그 뒤를 포함해야 한다.
+
+    가격 범위는 '기록한 날 종가 대비 비율'로 바꿔 비교한다 (배당 등으로 과거 수정주가가 바뀌어도 맞도록).
+    반환: dict(rows = 기록별 채점 표, summary = 지표). 아직 결과가 안 나온 기록은 채점에서 빠진다.
+    """
+    log = log.sort_values("asof")
+    px, idx = close.values, close.index
+    lr = np.diff(np.log(px))
+    rows = []
+    for _, r in log.iterrows():
+        i = idx.searchsorted(r["asof"], side="right") - 1          # 기록한 날(또는 그 직전 거래일)
+        if i < 0:
+            continue
+        h = int(r["h"])
+        out = {"asof": r["asof"], "p_up": r["p_up"], "p_base": r["p_base"], "model": r["model"], "p_high": r["p_high"]}
+        if i + 1 < len(px):
+            r1 = px[i + 1] / px[i] - 1
+            out.update(ret_1d=r1, exc95=float(r1 < -r["var95_1d"]), exc99=float(r1 < -r["var99_1d"]))
+        if i + h < len(px):
+            g = px[i + h] / px[i]
+            # 참/거짓은 숫자(1/0)로 둔다 — 결측과 섞인 object 열의 평균은 pandas에서 틀리게 나온다
+            out.update(done=1.0, up=float(g > 1), ret_h=g - 1, rv=np.sqrt(np.mean(lr[i:i + h] ** 2) * 252),
+                       vol_garch=r["vol_garch"], iv_atm=r["iv_atm"], vol_index=r["vol_index"],
+                       in68=float(r["lo68"] / r["close"] <= g <= r["hi68"] / r["close"]),
+                       in95=float(r["lo95"] / r["close"] <= g <= r["hi95"] / r["close"]))
+        rows.append(out)
+    rows = pd.DataFrame(rows)
+    s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max()}
+    if rows.empty:
+        return {"rows": rows, "summary": s}
+    if "exc95" in rows:
+        d1 = rows.dropna(subset=["ret_1d"])
+        s["하루 VaR 95%"] = var_exception_tests(d1["exc95"].values == 1, 0.05)
+        s["하루 VaR 99%"] = var_exception_tests(d1["exc99"].values == 1, 0.01)
+    done = rows[rows["done"] == 1] if "done" in rows else rows.iloc[:0]
+    s["채점 수"] = len(done)
+    if len(done):
+        h = int(log["h"].iloc[0])
+        up, p, b = done["up"].values, done["p_up"].values, done["p_base"].values
+        bs, bb = (p - up) ** 2, (b - up) ** 2
+        s.update({"적중률": float(np.mean((p > 0.5) == up)), "기본 확률 적중률": float(np.mean((b > 0.5) == up)),
+                  "확률 정확도 개선": float(1 - bs.mean() / bb.mean()) if bb.mean() > 0 else np.nan,
+                  "개선 z": overlap_tstat(bb - bs, h), "68% 범위 적중": float(done["in68"].mean()),
+                  "95% 범위 적중": float(done["in95"].mean())})
+        rmse = lambda c: float(np.sqrt(np.nanmean((done[c] - done["rv"]) ** 2))) if done[c].notna().any() else np.nan
+        s.update({"GARCH 오차": rmse("vol_garch"), "옵션 IV 오차": rmse("iv_atm"), "변동성 지수 오차": rmse("vol_index"),
+                  "불안 국면일 때 실제 변동성": float(done.loc[done["p_high"] >= 0.5, "rv"].mean()),
+                  "안정 국면일 때 실제 변동성": float(done.loc[done["p_high"] < 0.5, "rv"].mean())})
+    return {"rows": rows, "summary": s}
+
+
+def check():
+    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 두 종목 예측 + 파마-프렌치 요인을 받아 본다."""
+    ok = True
+    for t in ("SPY", "005930.KS"):
+        row = _predict_retry(t, tries=2, wait=20)
+        ok &= row is not None
+        print(t, row, flush=True)
+    ff = md.load_fama_french()
+    print("파마-프렌치:", None if ff is None else f"{ff.index[0].date()} ~ {ff.index[-1].date()}, 열 {list(ff.columns)}")
+    return ok and ff is not None
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "record":
+        new, failed = record()
+        print(f"추가 {len(new)}줄, 실패 {len(failed)}종목 {failed}")
+        sys.exit(1 if failed and not new else 0)      # 전부 실패했을 때만 실패로 표시 (알림 메일)
+    elif cmd == "check":
+        sys.exit(0 if check() else 1)
+    else:
+        print("사용법: python forecast_log.py record | check")

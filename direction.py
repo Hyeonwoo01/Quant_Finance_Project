@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 
 import alt_data
 import market_data
-from quant_engine import max_drawdown, overlap_tstat
+from quant_engine import deflated_sharpe, max_drawdown, overlap_tstat
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
@@ -319,7 +319,10 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1):
     equity = pd.DataFrame({"전략": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())}, index=wf.index)
     ann = lambda x: (x.mean() * 252, x.std() * np.sqrt(252))
     (sm, ss), (bm, bs) = ann(strat), ann(nxt)
-    return {**table["auto"], "table": table, "equity": equity, "time_in_market": float(pos.mean()),
+    # 요인 분석용: 수익이 실제로 실현된 날짜(판단일 + 1 + lag) 기준 일간 표. 아직 실현 안 된 마지막 날들은 뺀다
+    paid = pd.Series(daily_returns.index, index=daily_returns.index).shift(-(1 + lag)).reindex(wf.index)
+    daily = pd.DataFrame({"pos": pos.values, "strat": strat.values, "asset": nxt.values}, index=paid.values)[paid.notna().values]
+    return {**table["auto"], "table": table, "equity": equity, "daily": daily, "time_in_market": float(pos.mean()),
             "sharpe": sm / ss if ss > 0 else 0.0, "sharpe_bh": bm / bs if bs > 0 else 0.0,
             "mdd": max_drawdown(equity["전략"]), "mdd_bh": max_drawdown(equity["단순 보유"]),
             "chosen_share": wf["chosen"].value_counts(normalize=True)}
@@ -381,7 +384,34 @@ def robustness(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260)
         sub = wf.iloc[part]
         by_period[f"{sub.index[0].date()} ~ {sub.index[-1].date()}"] = _robust_row(evaluate(sub, h, daily_returns, cost_bps,
                                                                                       lag=lag))
-    return {"by_window": pd.DataFrame(by_window).T, "by_rule": by_rule, "by_period": pd.DataFrame(by_period).T}
+    return {"by_window": pd.DataFrame(by_window).T, "by_rule": by_rule, "by_period": pd.DataFrame(by_period).T,
+            "selection": selection_check(wf, h, daily_returns, cost_bps, windows, thresholds, lag)}
+
+
+def selection_check(wf, h, daily_returns, cost_bps=0.0, windows=(252, 504, 756, 1260), thresholds=(0.45, 0.5, 0.55), lag=1):
+    """(자동 선택 기간 × 보유 기준) 조합을 모두 시험해 1등을 골랐을 때의 착시 보정 (Deflated Sharpe).
+
+    각 조합의 일간 초과수익(전략 − 단순 보유, 비용 후)으로 샤프를 내고, 가장 좋은 조합이 시험 횟수를 감안해도
+    단순 보유보다 나을 확률을 계산한다. 모든 조합이 단순 보유와 똑같으면(초과수익 0) None.
+    """
+    ex = {}
+    for w in windows:
+        rw = reselect(wf, h, w)
+        for th in thresholds:
+            d = evaluate(rw, h, daily_returns, cost_bps, threshold=th, lag=lag)["daily"]
+            ex[(f"최근 {w // 252}년", f"{th:.0%}")] = (d["strat"] - d["asset"]).values
+    sr = {k: x.mean() / x.std() if x.std() > 1e-12 else np.nan for k, x in ex.items()}
+    valid = {k: v for k, v in sr.items() if np.isfinite(v)}
+    if not valid:
+        return None
+    best = max(valid, key=valid.get)
+    res = deflated_sharpe(ex[best], list(valid.values()))
+    if res is None:
+        return None
+    grid = pd.Series({k: v * np.sqrt(252) for k, v in sr.items()}).unstack()
+    grid.index.name, grid.columns.name = "자동 선택 기간", "보유 기준"
+    return {**res, "best": best, "sr_ann": res["sr"] * np.sqrt(252), "sr0_ann": res["sr0"] * np.sqrt(252),
+            "grid": grid, "n_flat": len(sr) - len(valid)}
 
 
 def horizon_check(close, macro=None, alt=None, ticker=None, cost_bps=0.0, horizons=(5, 10, 21, 42, 63),
