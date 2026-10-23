@@ -530,7 +530,7 @@ _full = pd.Series(100 * np.exp(np.cumsum(0.0003 + 0.011 * np.random.default_rng(
 _cut = {"n": 1100}
 _orig = {k: getattr(md, k) for k in ("load_history", "load_macro", "risk_free_rate", "dividend_yield", "atm_implied_vol",
                                      "load_vol_index")}
-_orig_alt = ad.build_alt_features
+_orig_alt = {k: getattr(ad, k) for k in ("build_alt_features", "options_snapshot", "estimate_revisions", "news_sentiment")}
 md.load_history = lambda t, years: _full.iloc[:_cut["n"]]
 md.load_macro = lambda t, years=10: None
 md.risk_free_rate = lambda t="", default=0.04: (0.04, "테스트")
@@ -538,6 +538,10 @@ md.dividend_yield = lambda t, s: 0.0
 md.atm_implied_vol = lambda t, s, d, r, q: {"iv": 0.19, "cal_days": 30}
 md.load_vol_index = lambda t, y: None
 ad.build_alt_features = lambda t, idx: (None, {})
+ad.options_snapshot = lambda t, s, r=0.04, q=0.0: {"pc_volume": 1.2, "pc_oi": 1.5, "skew": 0.05}
+ad.estimate_revisions = lambda t: pd.DataFrame({"30일 전 대비": [0.02, 0.01]}, index=["이번 분기", "올해"])
+ad.news_sentiment = lambda t, max_items=60: pd.DataFrame({"time": pd.to_datetime(["2026-01-01", "2026-01-05", "2026-01-20"]),
+                                                          "score": [1.0, -0.5, 0.25]})
 try:
     _path = Path(tempfile.mkdtemp()) / "log.csv"
     _new, _fail = fl.record(_path, ["SPY"])
@@ -550,10 +554,13 @@ try:
     _cut["n"] = 1100
     assert np.isclose(fl.predict("SPY")["p_up"], _row["p_up"]) and np.isclose(fl.predict("SPY")["lo68"], _row["lo68"])
     assert _row["lo95"] < _row["lo68"] < _row["close"] < _row["hi68"] < _row["hi95"] and 0 < _row["var95_1d"] < _row["var99_1d"]
+    # 시장 심리 지표도 앱과 같은 값으로 저장 (뉴스는 가장 최근 헤드라인 기준 7일: 1/20 하나만)
+    assert _row["pc_oi"] == 1.5 and _row["eps_rev_30d"] == 0.01 and _row["news_7d"] == 0.25 and _row["news_n"] == 1
 finally:
     for _k, _v in _orig.items():
         setattr(md, _k, _v)
-    ad.build_alt_features = _orig_alt
+    for _k, _v in _orig_alt.items():
+        setattr(ad, _k, _v)
 # 끝나지 않은 오늘 봉은 기록에 쓰지 않는다 (한국 15:30·미국 16:00 마감 + 여유)
 from datetime import datetime, timezone
 _kd = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-10-22", "2026-10-23"]))
@@ -583,4 +590,15 @@ assert _sc["summary"]["68% 범위 적중"] == 1.0 and np.isnan(_sc["summary"]["�
 _r1 = _cl.values[[1, 2, 3, 71]] / _cl.values[[0, 1, 2, 70]] - 1
 assert _sc["summary"]["하루 VaR 95%"]["예외 횟수"] == int((_r1 < 0).sum()) and _sc["summary"]["하루 VaR 99%"]["예외 횟수"] == 0
 assert np.isclose(_sc["summary"]["불안 국면일 때 실제 변동성"], _sc["rows"]["rv"].iloc[0])
+# 시장 심리 지표 채점: 다음 거래일 종가부터의 수익률과 비교. 그 수익률을 그대로 아는 지표면 상관 1
+_ci2 = pd.bdate_range("2025-01-01", periods=120)
+_cl2 = pd.Series(100 * np.exp(np.cumsum(0.01 * np.random.default_rng(3).standard_normal(120))), index=_ci2)
+_fut = _cl2.shift(-22) / _cl2.shift(-1) - 1
+_lg2 = pd.DataFrame({"asof": _ci2[:90], "ticker": "X", "close": _cl2.values[:90], "h": 21, "p_up": 0.5, "p_base": 0.5, "model": "m",
+                     "vol_garch": 0.15, "lo95": 0.0, "lo68": 0.0, "hi68": np.inf, "hi95": np.inf, "var95_1d": 0.02, "var99_1d": 0.03,
+                     "iv_atm": np.nan, "vol_index": np.nan, "p_high": 0.1, "news_7d": _fut.values[:90],
+                     "pc_oi": np.random.default_rng(4).standard_normal(90)})
+_st = fl.score(_lg2, _cl2)["summary"]["시장 심리 지표"]
+assert np.isclose(_st.loc["뉴스 감성 (최근 7일 평균)", "수익률과 상관"], 1.0) and _st.loc["뉴스 감성 (최근 7일 평균)", "표본"] == 90
+assert abs(_st.loc["풋/콜 미결제약정 비율", "수익률 t값"]) < 3 and np.isnan(_st.loc["옵션 스큐 (풋 90% − 콜 110% IV)", "수익률과 상관"])
 print("모든 테스트 통과")
