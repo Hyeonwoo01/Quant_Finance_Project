@@ -554,6 +554,18 @@ finally:
     for _k, _v in _orig.items():
         setattr(md, _k, _v)
     ad.build_alt_features = _orig_alt
+# 끝나지 않은 오늘 봉은 기록에 쓰지 않는다 (한국 15:30·미국 16:00 마감 + 여유)
+from datetime import datetime, timezone
+_kd = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-10-22", "2026-10-23"]))
+_utc = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+assert len(fl.drop_unfinished(_kd, "005930.KS", _utc("2026-10-23T01:00"))) == 1      # 한국 오전 10시 = 장중 → 뺌
+assert len(fl.drop_unfinished(_kd, "005930.KS", _utc("2026-10-23T08:37"))) == 2      # 한국 오후 5:37 → 그대로
+assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-23T16:00"))) == 1            # 뉴욕 정오 = 장중 → 뺌
+assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-24T08:37"))) == 2            # 다음 날 새벽 → 그대로
+# Cboe 변동성 지수 CSV (Yahoo에 없는 RVX 등)
+_cb = md.parse_cboe_csv("DATE,OPEN,HIGH,LOW,CLOSE\n10/21/2026,20.1,21.0,19.5,20.5\n10/22/2026,20.5,22.0,20.0,21.25\n")
+assert list(_cb.index.strftime("%Y-%m-%d")) == ["2026-10-21", "2026-10-22"] and _cb.iloc[-1] == 21.25
+
 # 채점: 손으로 만든 기록과 가격으로 계산이 맞는지
 _ci = pd.bdate_range("2025-01-01", periods=80)
 _cl = pd.Series(100 * np.exp(np.cumsum(np.r_[0, 0.01 * np.random.default_rng(2).standard_normal(79)])), index=_ci)

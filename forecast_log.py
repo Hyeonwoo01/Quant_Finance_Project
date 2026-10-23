@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,21 @@ COLUMNS = ["asof", "ticker", "close", "h", "p_up", "p_base", "model", "vol_garch
            "var95_1d", "var99_1d", "garch_ok", "iv_atm", "iv_days", "vol_index", "p_high", "version", "logged_at"]
 
 
+# 거래소별 (시간대, 장 마감 시각 + 여유 분). 그 전에 돌리면 오늘 봉은 아직 움직이는 중이라 쓰지 않는다.
+_SESSIONS = {"KR": ("Asia/Seoul", 15 * 60 + 30 + 40), "US": ("America/New_York", 16 * 60 + 30)}
+
+
+def drop_unfinished(close, ticker, now=None):
+    """마지막 봉이 '오늘'이고 그 거래소가 아직 마감 전(여유 포함)이면 빼고 돌려준다.
+
+    수동 실행이나 예약 시각이 장중에 걸려도, 끝나지 않은 가격으로 예측을 기록하지 않도록."""
+    tz, cutoff = _SESSIONS["US" if md.is_us_ticker(ticker) else "KR"]
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz))
+    if close.index[-1].date() == local.date() and local.hour * 60 + local.minute < cutoff:
+        return close.iloc[:-1]
+    return close
+
+
 def tickers(path=TICKERS_PATH):
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     return [s.split("#")[0].strip() for s in lines if s.split("#")[0].strip()]
@@ -48,7 +64,7 @@ def read_log(path=LOG_PATH):
 
 def predict(ticker, h=H, have=frozenset()):
     """앱 기본 설정과 같은 계산으로 오늘(마지막 종가 기준)의 예측 한 줄. 그 날짜가 이미 기록돼 있으면(휴장일 등) skip 표시만."""
-    close = md.load_history(ticker, 10)
+    close = drop_unfinished(md.load_history(ticker, 10), ticker)
     asof, spot = close.index[-1], float(close.iloc[-1])
     row = {"asof": asof.date().isoformat(), "ticker": ticker, "close": spot, "h": h}
     if (row["asof"], ticker) in have:
@@ -173,12 +189,16 @@ def score(log, close):
 
 
 def check():
-    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 두 종목 예측 + 파마-프렌치 요인을 받아 본다."""
+    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 두 종목 예측 + 변동성 지수 + 파마-프렌치 요인을 받아 본다."""
     ok = True
     for t in ("SPY", "005930.KS"):
         row = _predict_retry(t, tries=2, wait=20)
         ok &= row is not None
         print(t, row, flush=True)
+    for t in ("SPY", "QQQ", "IWM"):
+        vi = md.load_vol_index(t, 1)
+        ok &= vi is not None
+        print(f"{t} 변동성 지수:", None if vi is None else f"{vi.index[-1].date()} {vi.iloc[-1]:.4f} ({len(vi)}일)", flush=True)
     ff = md.load_fama_french()
     print("파마-프렌치:", None if ff is None else f"{ff.index[0].date()} ~ {ff.index[-1].date()}, 열 {list(ff.columns)}")
     return ok and ff is not None

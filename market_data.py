@@ -28,14 +28,35 @@ VOL_INDEX = {"SPY": "^VIX", "VOO": "^VIX", "IVV": "^VIX", "^GSPC": "^VIX",
              "QQQ": "^VXN", "^NDX": "^VXN", "IWM": "^RVX", "^RUT": "^RVX"}
 
 
+CBOE_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/{}_History.csv"
+
+
+def parse_cboe_csv(text):
+    """Cboe 지수 일별 CSV(DATE, OPEN, HIGH, LOW, CLOSE — 날짜는 월/일/연) → 종가 Series."""
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [c.strip().upper() for c in df.columns]
+    s = pd.Series(pd.to_numeric(df["CLOSE"], errors="coerce").values,
+                  index=pd.to_datetime(df["DATE"], format="%m/%d/%Y"), name="Close").dropna()
+    return s[s > 0].sort_index()
+
+
 def load_vol_index(ticker, years):
-    """이 종목에 맞는 변동성 지수의 과거 값(소수, 예: 0.18). 없으면 None."""
+    """이 종목에 맞는 변동성 지수의 과거 값(소수, 예: 0.18). 없으면 None.
+
+    Yahoo에서 먼저 받고, 없으면(예: RVX는 Yahoo에서 빠짐) Cboe가 무료로 올려 두는 공식 일별 CSV로 받는다."""
     sym = VOL_INDEX.get(ticker.upper())
     if sym is None:
         return None
     try:
         return load_history(sym, years) / 100.0
-    except ValueError:
+    except Exception:
+        pass
+    try:
+        raw = requests.get(CBOE_URL.format(sym.lstrip("^")), headers=_UA, timeout=20)
+        raw.raise_for_status()
+        s = parse_cboe_csv(raw.text)
+        return s[s.index > s.index[-1] - pd.DateOffset(years=years)] / 100.0
+    except Exception:
         return None
 
 
