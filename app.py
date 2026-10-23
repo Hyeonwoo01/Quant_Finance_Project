@@ -747,7 +747,7 @@ with tab_snap:
     rv = snap["revisions"]
     code = ad.krx_code(ticker)
     if code:
-        st.caption("한국 종목은 네이버 증권의 실적과 전망치를 보여줍니다. **(E)**가 붙은 열은 애널리스트들의 평균 전망치입니다. "
+        st.caption("한국 종목은 네이버 증권의 실적과 전망치를 보여줍니다. (E)가 붙은 열은 애널리스트들의 평균 전망치입니다. "
                    "금액 단위: 억원, 비율: %")
         for label, period in (("분기", "quarter"), ("연간", "annual")):
             try:
