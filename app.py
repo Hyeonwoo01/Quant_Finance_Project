@@ -785,10 +785,10 @@ with tab_snap:
     if code:
         st.subheader("외국인·기관 수급 (최근 60거래일)")
         try:
-            fl = ad.load_investor_flows(code, close.index[-60]).iloc[-60:]
+            flw = ad.load_investor_flows(code, close.index[-60]).iloc[-60:]      # fl(실전 기록 모듈)과 겹치지 않게
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=fl.index, y=fl["frgn"], name="외국인 순매수(주)", marker_color=ui.BLUE))
-            fig.add_trace(go.Bar(x=fl.index, y=fl["inst"], name="기관 순매수(주)", marker_color=ui.AMBER))
+            fig.add_trace(go.Bar(x=flw.index, y=flw["frgn"], name="외국인 순매수(주)", marker_color=ui.BLUE))
+            fig.add_trace(go.Bar(x=flw.index, y=flw["inst"], name="기관 순매수(주)", marker_color=ui.AMBER))
             fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
