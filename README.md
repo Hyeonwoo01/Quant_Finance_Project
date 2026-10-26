@@ -3,6 +3,7 @@
 변동성 트레이딩 파이프라인(블랙-숄즈 IV → GARCH 변동성 예측 → 신호 → 델타헤지)을 Streamlit 앱으로 만든 프로젝트입니다.
 모든 예측은 **그 시점까지의 데이터로만 학습하는 워크포워드 방식**으로 검증하고, 검증 결과를 화면에 함께 보여줍니다.
 분석·검증용 도구이며 주문을 내는 실거래 시스템이 아닙니다 ([범위와 한계](#범위와-한계)).
+각 모델의 수식·쉬운 풀이·검증 방법은 **[MODELS.md](MODELS.md)** 에 정리했습니다.
 
 ![tests](https://github.com/Hyeonwoo01/Quant_Finance_Project/actions/workflows/tests.yml/badge.svg)
 
@@ -94,6 +95,7 @@ python -m venv .venv
 | `.github/workflows/tests.yml` | 푸시·PR마다 `tests.py` 자동 실행 (Python 3.12·3.13) |
 | `.github/workflows/forecast-log.yml` | 평일마다 실전 기록 추가·커밋 (예약 실행은 main에서만). 관련 코드가 바뀐 푸시에서는 저장 없이 실제 데이터 연결만 점검 |
 | `requirements.txt` | 테스트를 통과한 패키지 버전 고정 |
+| `MODELS.md` | 모델 설명: 수식, 쉬운 풀이, 코드 위치, 검증 방법 |
 
 ## 검증 결과 메모
 
